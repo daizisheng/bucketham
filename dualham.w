@@ -190,7 +190,7 @@ Comp* comps[MAXLEV]; long ncomp[MAXLEV];
 long nstate[MAXLEV+1]; int Plevs;
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int stop_after_record=0; int direct_cov_g=0;
-static u64 colfp_g[4096]; const char* ckpt_path=0;   /* per-column build checkpoint */
+static u64 colfp_g[4096]; const char* ckpt_path=0; int ckpt_every=4;   /* checkpoint every K columns */
 u64* seedv; long seedn;
 Comp* reccomp_buf; long reccomp_n, reccomp_cap;
 int ecmp(const void*A,const void*B){ const Edge*a=A,*b=B; if(a->dst!=b->dst) return a->dst-b->dst; return a->src-b->src; }
@@ -336,7 +336,7 @@ int run_periodic(int mm,int Wb,int Next){
           period_g=period; c0_g=c0; recend_col_g=c0+period;
           fprintf(stderr,"stable col %d, period %d\n",c0,period); } } }
     if(s%m==m-1 && getenv("DBG")) fprintf(stderr,"  col %d ncur=%ld rec=%d\n",s/m,ncur,recording);
-    if(!recording && s%m==m-1) save_ckpt(s+1);
+    if(!recording && s%m==m-1 && (s/m)%ckpt_every==0) save_ckpt(s+1);
     if(recording && s==recend && stop_after_record) break;
   }
   direct_cov_g = stop_after_record ? recend_col_g : n;
@@ -392,7 +392,7 @@ void spmv_run(int Nto,int crosscheck);
 int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
   if(argc>=5 && !strcmp(argv[1],"build")){ /* build m Wb file [ckpt] : build+extract, dump tables */
-    stop_after_record=1; if(argc>=6) ckpt_path=argv[5];
+    stop_after_record=1; if(argc>=6) ckpt_path=argv[5]; if(argc>=7) ckpt_every=atoi(argv[6]);
     build_extract(atoi(argv[2]),atoi(argv[3])); dump_tables(argv[4]); return 0; }
   if(argc==5 && !strcmp(argv[1],"resume")){ /* resume ckpt Wb file : continue a build */
     stop_after_record=1; resume_from=load_ckpt(argv[2]); ckpt_path=argv[2];

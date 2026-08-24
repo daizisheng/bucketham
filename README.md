@@ -52,7 +52,7 @@ make dualham                     # tangle + compile the dual engine
 ./dualham 5 20 30                # build, then SpMV-extend to col 30 (one process)
 
 # crash-resilient, two-phase (recommended for big m):
-./dualham build 8 40 t.bin ck.bin   # build+extract, checkpoint each column to ck.bin,
+./dualham build 8 40 t.bin ck.bin 8 # build+extract, checkpoint every 8 columns to ck.bin,
                                      #   dump the periodic tables to t.bin
 ./dualham resume ck.bin 40 t.bin     # a crashed build resumes from ck.bin
 ./dualham run t.bin 300              # reload tables, SpMV open 8xc out to col 300
