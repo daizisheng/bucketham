@@ -24,6 +24,7 @@ which is exactly what makes the transfer periodic and the SpMV possible.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <omp.h>
 @#
 @<Types@>@;
 @<Globals@>@;
@@ -70,6 +71,7 @@ rest of the board frontier is bare; |completion_mp| returns that~$m'$.
 
 @<Globals@>=
 int mate[MAXF]; int cycle;
+#pragma omp threadprivate(mate,cycle)
 
 @ @<Subroutines@>=
 int add_derived(int i,int j){ cycle=0;
@@ -95,14 +97,27 @@ typedef struct { long off; int len; u64 w; long src; } Rec;
 
 @ @<Globals@>=
 unsigned char*kp; long kcap,kuse; Rec*rc; long nr,rcap; unsigned char*cb;
+@#
+#define NTMAX 128
+unsigned char* tkp[NTMAX]; long tkuse[NTMAX], tkcap[NTMAX];
+Rec* trc[NTMAX]; long tnr[NTMAX], trcap[NTMAX];
 int rcmp(const void*A,const void*B){ const Rec*a=A,*b=B; int l=a->len<b->len?a->len:b->len;
   int d=memcmp(cb+a->off,cb+b->off,l); return d?d:a->len-b->len; }
 
 @ @<Subroutines@>=
 void emit(unsigned char*key,int len,u64 w,long src){
-  if(kuse+len>kcap){kcap=kcap*2+len+65536;kp=realloc(kp,kcap);}
-  if(nr>=rcap){rcap=rcap*2+65536;rc=realloc(rc,rcap*sizeof(Rec));}
-  memcpy(kp+kuse,key,len); rc[nr].off=kuse; rc[nr].len=len; rc[nr].w=w; rc[nr].src=src; kuse+=len; nr++; }
+  int t=omp_get_thread_num();
+  if(tkuse[t]+len>tkcap[t]){tkcap[t]=tkcap[t]*2+len+65536;tkp[t]=realloc(tkp[t],tkcap[t]);}
+  if(tnr[t]>=trcap[t]){trcap[t]=trcap[t]*2+65536;trc[t]=realloc(trc[t],trcap[t]*sizeof(Rec));}
+  memcpy(tkp[t]+tkuse[t],key,len); trc[t][tnr[t]].off=tkuse[t]; trc[t][tnr[t]].len=len;
+  trc[t][tnr[t]].w=w; trc[t][tnr[t]].src=src; tkuse[t]+=len; tnr[t]++; }
+void merge_pools(void){ int t; long r; nr=0; kuse=0;
+  for(t=0;t<omp_get_max_threads();t++){ for(r=0;r<tnr[t];r++){ Rec*R=&trc[t][r];
+    if(kuse+R->len>kcap){kcap=kcap*2+R->len+65536;kp=realloc(kp,kcap);}
+    if(nr>=rcap){rcap=rcap*2+65536;rc=realloc(rc,rcap*sizeof(Rec));}
+    memcpy(kp+kuse,tkp[t]+R->off,R->len);
+    rc[nr].off=kuse; rc[nr].len=R->len; rc[nr].w=R->w; rc[nr].src=R->src; kuse+=R->len; nr++; }
+    tnr[t]=0; tkuse[t]=0; } }
 
 @* The transfer step.
 The bucket holds states as (key,weight) over the previous frontier. To place
@@ -115,7 +130,9 @@ and the completion contributions for this level.
 @<Globals@>=
 unsigned char*curkp; long*curoff; int*curkl; u64*curw; long ncur;
 u64 cnt[1<<16];
+u64 MODP=2147483647ULL;   /* 2^31-1, Mersenne prime; run several for CRT */
 int qnew, posS, apexnew, STEMP; int bmate[MAXF], o2n[MAXF];
+#pragma omp threadprivate(bmate,STEMP)
 @#
 int recording, reclev;
 typedef struct{ int src,dst; u64 c; } Edge;
@@ -149,31 +166,40 @@ void run_step(int s,int rec){
   @<Sort, reduce, and (if recording) capture the edge table@>;
 }
 
-@ @<Expand every state at cell |s|@>=
+@ Each state expands independently, so the loop runs in parallel (except while
+recording, when it stays serial to keep the completion log ordered). The
+transition scratch (|mate|, |bmate|, |cycle|, |STEMP|) is |threadprivate|; each
+thread emits into its own pool; |cnt| is updated in a critical section.
+
+@<Expand every state at cell |s|@>=
+#pragma omp parallel for if(!rec) schedule(dynamic,32)
 for(si=0;si<ncur;si++){
-  unsigned char*ok=curkp+curoff[si]; int okl=curkl[si]; u64 w=curw[si];
-  static int omate[MAXF]; int a,b;
-  for(i=0;i<okl;i++){int c=ok[i]; omate[i]= c==0?-2 : c==255?-1 : c-1;}
-  int deg=omate[posS]==-2?0:omate[posS]==-1?2:1, need=2-deg;
-  unsigned char nk[MAXF]; int nl;
+  int i,a,b,nl,deg,need,mp; unsigned char*ok=curkp+curoff[si]; int okl=curkl[si]; u64 w=curw[si];
+  int omate[MAXF]; unsigned char nk[MAXF];
+  for(i=0;i<okl;i++){int cc=ok[i]; omate[i]= cc==0?-2 : cc==255?-1 : cc-1;}
+  deg=omate[posS]==-2?0:omate[posS]==-1?2:1; need=2-deg;
   if(need==0){ build_bmate(omate,qold); for(i=0;i<qnew;i++) mate[i]=bmate[i]; nl=keyof(qnew,nk); emit(nk,nl,w,si); }
   else if(need==1){ for(a=0;a<rr;a++){ build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
     if(add_derived(STEMP,nbr[a])){ nl=keyof(qnew,nk); emit(nk,nl,w,si); }
-    else if(cycle){ int mp=completion_mp(qnew,apexnew,frnew,s); if(mp){ cnt[mp]+=w; @<Record a completion@>; } } } }
+    else if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } } }
   else { for(a=0;a<rr;a++)for(b=a+1;b<rr;b++){ build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
-    if(!add_derived(STEMP,nbr[a])){ if(cycle){ int mp=completion_mp(qnew,apexnew,frnew,s); if(mp){ cnt[mp]+=w; @<Record a completion@>; } } continue; }
+    if(!add_derived(STEMP,nbr[a])){ if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } continue; }
     if(add_derived(STEMP,nbr[b])){ nl=keyof(qnew,nk); emit(nk,nl,w,si); }
-    else if(cycle){ int mp=completion_mp(qnew,apexnew,frnew,s); if(mp){ cnt[mp]+=w; @<Record a completion@>; } } } }
+    else if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } } }
 }
 
-@ @<Record a completion@>=
-if(rec){ reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; }
+@ @<Credit completion@>=
+{
+#pragma omp critical
+  { cnt[mp]=(cnt[mp]+w)%MODP;
+    if(rec){ reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; } }
+}
 
 @ The reduce also, when recording, resolves each emitted record's destination to
 its bucket index, giving integer edges $(\hbox{src},\hbox{dst},\hbox{coeff})$.
 
 @<Sort, reduce, and (if recording) capture the edge table@>=
-{ cb=kp; qsort(rc,nr,sizeof(Rec),rcmp);
+{ merge_pools(); cb=kp; qsort(rc,nr,sizeof(Rec),rcmp);
   curoff=realloc(curoff,(nr+1)*sizeof(long)); curkl=realloc(curkl,(nr+1)*sizeof(int));
   curw=realloc(curw,(nr+1)*sizeof(u64)); curkp=realloc(curkp,kuse+1);
   Edge* eb=0; long enb=0; if(rec) eb=malloc((nr+1)*sizeof(Edge));
@@ -181,7 +207,7 @@ its bucket index, giving integer edges $(\hbox{src},\hbox{dst},\hbox{coeff})$.
   for(ri=0;ri<nr;){ long j=ri+1; u64 sw=rc[ri].w;
     if(rec){ long t; for(t=ri;t<nr;t++){ if(t>ri && !(rc[t].len==rc[ri].len && memcmp(kp+rc[t].off,kp+rc[ri].off,rc[ri].len)==0)) break;
         eb[enb].src=(int)rc[t].src; eb[enb].dst=(int)k; eb[enb].c=1; enb++; } }
-    while(j<nr&&rc[j].len==rc[ri].len&&memcmp(kp+rc[j].off,kp+rc[ri].off,rc[ri].len)==0){sw+=rc[j].w;j++;}
+    while(j<nr&&rc[j].len==rc[ri].len&&memcmp(kp+rc[j].off,kp+rc[ri].off,rc[ri].len)==0){sw=(sw+rc[j].w)%MODP;j++;}
     memcpy(curkp+use,kp+rc[ri].off,rc[ri].len); curoff[k]=use; curkl[k]=rc[ri].len; curw[k]=sw; use+=rc[ri].len; k++; ri=j; }
   ncur=k;
   if(rec){ long o=0,p; qsort(eb,enb,sizeof(Edge),ecmp);
@@ -232,9 +258,9 @@ int run_periodic(int mm,int Wb,int Next){
   int basecol=c0+1;
   while(basecol<=Next){ int L;
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
-      for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]+=v[comps[L][e].src]*comps[L][e].mult; }
+      for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]=(cnt2[idx]+v[comps[L][e].src]*comps[L][e].mult)%MODP; }
       u64* vn=calloc(nstate[L+1],sizeof(u64));
-      for(e=0;e<nedge[L];e++) vn[edges[L][e].dst]+=v[edges[L][e].src]*edges[L][e].c;
+      for(e=0;e<nedge[L];e++) vn[edges[L][e].dst]=(vn[edges[L][e].dst]+v[edges[L][e].src]*edges[L][e].c)%MODP;
       free(v); v=vn; }
     basecol+=period; }
   free(v); }
@@ -258,8 +284,8 @@ int main(int argc,char*argv[]){
   int i,bad=0,lm=0,lw=0;
   for(i=0;chk[i].m;i++){
     if(chk[i].m!=lm||chk[i].Wb!=lw){ run_periodic(chk[i].m,chk[i].Wb,chk[i].Wb); lm=chk[i].m; lw=chk[i].Wb; }
-    u64 g=cnt[chk[i].c*chk[i].m];
-    printf("open %dx%d = %llu  exp %llu  %s\n",chk[i].m,chk[i].c,g,chk[i].e,g==chk[i].e?"OK":"FAIL");
-    if(g!=chk[i].e) bad++; }
+    u64 g=cnt[chk[i].c*chk[i].m], e=chk[i].e%MODP;
+    printf("open %dx%d = %llu  exp(mod p) %llu  %s\n",chk[i].m,chk[i].c,g,e,g==e?"OK":"FAIL");
+    if(g!=e) bad++; }
   printf("%s\n",bad?"SOME FAILED":"ALL OK"); return bad?1:0;
 }
