@@ -47,10 +47,19 @@ Needs a C compiler and (for `pdf`) a CWEB + TeX installation
   `periodic.c` are the C prototypes the CWEB was derived and validated from.
 
 ```sh
-make dualham          # tangle + compile the dual engine
-./dualham             # self-checks
-./dualham 5 20 30     # build 5×n to col 20, then SpMV-extend counts to col 30
+make dualham                     # tangle + compile the dual engine
+./dualham                        # self-checks
+./dualham 5 20 30                # build, then SpMV-extend to col 30 (one process)
+
+# crash-resilient, two-phase (recommended for big m):
+./dualham build 8 40 t.bin ck.bin   # build+extract, checkpoint each column to ck.bin,
+                                     #   dump the periodic tables to t.bin
+./dualham resume ck.bin 40 t.bin     # a crashed build resumes from ck.bin
+./dualham run t.bin 300              # reload tables, SpMV open 8xc out to col 300
 ```
+
+Arithmetic is mod `2^31-1` (no overflow at any `n`); run several primes and CRT
+for exact values. The build (`expand` + `sort/reduce`) is OpenMP-parallel.
 
 ## Status
 

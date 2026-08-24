@@ -138,18 +138,25 @@ void sort_reduce(int s,int rec){
   static long idx[NTMAX]; for(t=0;t<NT;t++) idx[t]=0;
   Edge* eb=0; long enb=0; if(rec) eb=malloc((tot+1)*sizeof(Edge));
   long k=0,use=0;
-  for(;;){ int mt=-1;
-    for(t=0;t<NT;t++) if(idx[t]<tnr[t]){ if(mt<0){mt=t;} else {
-      Rec*A=&trc[t][idx[t]],*B=&trc[mt][idx[mt]]; int l=A->len<B->len?A->len:B->len;
-      int d=memcmp(tkp[t]+A->off,tkp[mt]+B->off,l); if(d<0||(d==0&&A->len<B->len)) mt=t; } }
-    if(mt<0) break;
-    Rec*M=&trc[mt][idx[mt]]; unsigned char*mkey=tkp[mt]+M->off; int mlen=M->len;
-    memcpy(curkp+use,mkey,mlen); curoff[k]=use; curkl[k]=mlen; u64 sw=0;
-    for(t=0;t<NT;t++){ while(idx[t]<tnr[t]){ Rec*R=&trc[t][idx[t]];
-      if(R->len==mlen && memcmp(tkp[t]+R->off,mkey,mlen)==0){ sw=(sw+R->w)%MODP;
-        if(rec){ eb[enb].src=(int)R->src; eb[enb].dst=(int)k; eb[enb].c=1; enb++; } idx[t]++; }
-      else break; } }
-    curw[k]=sw; use+=mlen; k++; }
+  static int heap[NTMAX]; int hn=0;
+#define HKEY(t) (tkp[t]+trc[t][idx[t]].off)
+#define HLEN(t) (trc[t][idx[t]].len)
+#define HLESS(a,b) ({ int la_=HLEN(a),lb_=HLEN(b),l_=la_<lb_?la_:lb_; int d_=memcmp(HKEY(a),HKEY(b),l_); d_<0||(d_==0&&la_<lb_); })
+  for(t=0;t<NT;t++) if(idx[t]<tnr[t]){ int c=hn++; heap[c]=t;
+    while(c>0){ int pp=(c-1)/2; if(HLESS(heap[c],heap[pp])){ int x=heap[c];heap[c]=heap[pp];heap[pp]=x; c=pp; } else break; } }
+  int curlen=-1; long curpos=0; u64 sw=0;
+  while(hn>0){ int mt=heap[0]; Rec*R=&trc[mt][idx[mt]]; unsigned char*rkey=tkp[mt]+R->off; int rlen=R->len;
+    int same=(curlen==rlen && memcmp(curkp+curpos,rkey,rlen)==0);
+    if(!same){ if(curlen>=0){ curw[k]=sw; k++; }
+      curpos=use; memcpy(curkp+use,rkey,rlen); curoff[k]=use; curkl[k]=rlen; use+=rlen; curlen=rlen; sw=0; }
+    sw=(sw+R->w)%MODP;
+    if(rec){ eb[enb].src=(int)R->src; eb[enb].dst=(int)k; eb[enb].c=1; enb++; }
+    idx[mt]++;
+    if(idx[mt]>=tnr[mt]) heap[0]=heap[--hn];
+    { int c=0; while(1){ int l=2*c+1,r=2*c+2,sm=c;
+      if(l<hn && HLESS(heap[l],heap[sm])) sm=l; if(r<hn && HLESS(heap[r],heap[sm])) sm=r;
+      if(sm==c) break; int x=heap[c];heap[c]=heap[sm];heap[sm]=x; c=sm; } } }
+  if(curlen>=0){ curw[k]=sw; k++; }
   ncur=k;
   for(t=0;t<NT;t++){ tnr[t]=0; tkuse[t]=0; }
   if(rec){ long o=0,p; qsort(eb,enb,sizeof(Edge),ecmp);
@@ -180,6 +187,9 @@ typedef struct{ int src,delta; u64 mult; } Comp;
 Edge* edges[MAXLEV]; long nedge[MAXLEV];
 Comp* comps[MAXLEV]; long ncomp[MAXLEV];
 long nstate[MAXLEV+1]; int Plevs;
+int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
+int stop_after_record=0;
+static u64 colfp_g[4096]; const char* ckpt_path=0;   /* per-column build checkpoint */
 u64* seedv; long seedn;
 Comp reccomp_buf[1<<20]; long reccomp_n;
 int ecmp(const void*A,const void*B){ const Edge*a=A,*b=B; if(a->src!=b->src) return a->src-b->src; return a->dst-b->dst; }
@@ -241,7 +251,58 @@ for(si=0;si<ncur;si++){
 @<Sort, reduce, and (if recording) capture the edge table@>=
 sort_reduce(s,rec);
 
-@* Driver: build, extract the period, then SpMV.
+@* Checkpointing the build.
+The build (the sweep that discovers the periodic transfer) is the long part; we
+checkpoint it at every column boundary before recording begins, dumping the
+current bucket, the running counts, and the fingerprints. A build that dies
+resumes from the last boundary; the recording columns themselves are few, so if
+a crash lands inside them we simply restart from the last pre\--recording
+checkpoint.
+
+@<Subroutines@>=
+void save_ckpt(int nexts){ if(!ckpt_path) return; FILE*f=fopen(ckpt_path,"wb");
+  fwrite(&m,sizeof(int),1,f); fwrite(&nexts,sizeof(int),1,f);
+  fwrite(cnt,sizeof(u64),1<<16,f); fwrite(colfp_g,sizeof(u64),4096,f);
+  fwrite(&ncur,sizeof(long),1,f); fwrite(&kuse,sizeof(long),1,f);
+  fwrite(curoff,sizeof(long),ncur,f); fwrite(curkl,sizeof(int),ncur,f);
+  fwrite(curw,sizeof(u64),ncur,f);
+  { long kb=0,i; for(i=0;i<ncur;i++) kb+=curkl[i]; fwrite(&kb,sizeof(long),1,f); fwrite(curkp,1,kb,f); }
+  fclose(f); }
+int load_ckpt(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return -1; int nexts,mm;
+  if(fread(&mm,sizeof(int),1,f)!=1) return -1; m=mm; fread(&nexts,sizeof(int),1,f);
+  fread(cnt,sizeof(u64),1<<16,f); fread(colfp_g,sizeof(u64),4096,f);
+  fread(&ncur,sizeof(long),1,f); fread(&kuse,sizeof(long),1,f);
+  curoff=realloc(curoff,(ncur+1)*sizeof(long)); curkl=realloc(curkl,(ncur+1)*sizeof(int)); curw=realloc(curw,(ncur+1)*sizeof(u64));
+  fread(curoff,sizeof(long),ncur,f); fread(curkl,sizeof(int),ncur,f); fread(curw,sizeof(u64),ncur,f);
+  { long kb; fread(&kb,sizeof(long),1,f); curkp=realloc(curkp,kb+1); fread(curkp,1,kb,f); }
+  fclose(f); fprintf(stderr,"resumed build from %s at cell %d (col %d)\n",path,nexts,nexts/mm); return nexts; }
+
+@ @* Dumping and reloading the extracted tables.
+The expensive part is the build that discovers and records the periodic transfer.
+Once recorded, the tables (edge tables, completions, seed vector, level sizes,
+period, and the directly\--counted columns up to |recend_col_g|) are small and
+self\--contained, so we dump them to disk. A later run reloads them and does only
+the cheap SpMV --- and a build that dies can be re\--run without touching the SpMV.
+
+@<Subroutines@>=
+void dump_tables(const char*path){ FILE*f=fopen(path,"wb"); int L;
+  int hdr[5]={m,period_g,c0_g,Plevs,recend_col_g}; fwrite(hdr,sizeof(int),5,f);
+  fwrite(&seedn,sizeof(long),1,f); fwrite(seedv,sizeof(u64),seedn,f);
+  fwrite(nstate,sizeof(long),Plevs+1,f);
+  for(L=0;L<Plevs;L++){ fwrite(&nedge[L],sizeof(long),1,f); fwrite(edges[L],sizeof(Edge),nedge[L],f);
+    fwrite(&ncomp[L],sizeof(long),1,f); fwrite(comps[L],sizeof(Comp),ncomp[L],f); }
+  int nc=(recend_col_g+1)*m; fwrite(&nc,sizeof(int),1,f); fwrite(cnt,sizeof(u64),nc,f);
+  fclose(f); fprintf(stderr,"dumped tables to %s (period %d, c0 %d, %d levels)\n",path,period_g,c0_g,Plevs); }
+int load_tables(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return 0; int L,hdr[5];
+  if(fread(hdr,sizeof(int),5,f)!=5) return 0; m=hdr[0]; period_g=hdr[1]; c0_g=hdr[2]; Plevs=hdr[3]; recend_col_g=hdr[4];
+  fread(&seedn,sizeof(long),1,f); seedv=malloc(seedn*sizeof(u64)); fread(seedv,sizeof(u64),seedn,f);
+  fread(nstate,sizeof(long),Plevs+1,f);
+  for(L=0;L<Plevs;L++){ fread(&nedge[L],sizeof(long),1,f); edges[L]=malloc((nedge[L]+1)*sizeof(Edge)); fread(edges[L],sizeof(Edge),nedge[L],f);
+    fread(&ncomp[L],sizeof(long),1,f); comps[L]=malloc((ncomp[L]+1)*sizeof(Comp)); fread(comps[L],sizeof(Comp),ncomp[L],f); }
+  int nc; fread(&nc,sizeof(int),1,f); memset(cnt,0,sizeof(cnt)); fread(cnt,sizeof(u64),nc,f);
+  fclose(f); return 1; }
+
+@ @* Driver: build, extract the period, then SpMV.
 Sweep an $m\times W_b$ strip; when the boundary key\--set (fingerprinted) repeats
 with period $p\in\{1,2\}$ at column~$c_0$, record the next $p$ columns' edge
 tables and capture the seed vector. Then iterate the SpMV to reach column
@@ -250,6 +311,7 @@ level's completions to |cnt2|. The two agree on every column the SpMV fully
 covers ($c\ge c_0+3$), and the SpMV alone yields the columns past~$W_b$.
 
 @<Subroutines@>=
+int resume_from=0;
 void seed_bucket(void){ int i; int q=frontier_before(0);
   for(i=0;i<q;i++) mate[i]=-2; unsigned char key[MAXF]; int kl=keyof(q,key);
   curkp=malloc(1<<20); curoff=malloc(sizeof(long)); curkl=malloc(sizeof(int)); curw=malloc(sizeof(u64));
@@ -257,35 +319,51 @@ void seed_bucket(void){ int i; int q=frontier_before(0);
 @#
 u64 cnt2[1<<16];
 int run_periodic(int mm,int Wb,int Next){
-  int i,s,c; m=mm; n=Wb; build_board(); memset(cnt,0,sizeof(cnt)); memset(cnt2,0,sizeof(cnt2));
+  int i,s,c; m=mm; n=Wb; build_board(); memset(cnt2,0,sizeof(cnt2));
   recording=0; reclev=0;
-  seed_bucket();
-  static u64 colfp[4096]; int c0=-1,period=0,recstart=-1,recend=-1;
-  for(s=0;s<V;s++){
+  if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
+  int c0=-1,period=0,recstart=-1,recend=-1;
+  for(s=(resume_from>0?resume_from:0);s<V;s++){
     if(recording && s==recstart){ seedn=ncur; seedv=malloc(ncur*sizeof(u64)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0; }
     run_step(s, recording && s>=recstart && s<=recend);
     if(s%m==m-1){ c=s/m; u64 h=1469598103934665603ULL; long t;
       for(t=0;t<ncur;t++){ unsigned char*kk=curkp+curoff[t]; int L=curkl[t],z; for(z=0;z<L;z++){ h^=kk[z]; h*=1099511628211ULL; } h^=0x9e; h*=1099511628211ULL; }
-      colfp[c]=h;
-      if(c0<0){ if(c>=1&&colfp[c]==colfp[c-1]){period=1;c0=c;} else if(c>=2&&colfp[c]==colfp[c-2]){period=2;c0=c;}
+      colfp_g[c]=h;
+      if(c0<0){ if(c>=1&&colfp_g[c]==colfp_g[c-1]){period=1;c0=c;} else if(c>=2&&colfp_g[c]==colfp_g[c-2]){period=2;c0=c;}
         if(c0>=0){ recstart=(c0+1)*m; recend=(c0+1+period)*m-1; Plevs=period*m; recording=1;
+          period_g=period; c0_g=c0; recend_col_g=c0+period;
           fprintf(stderr,"stable col %d, period %d\n",c0,period); } } }
+    if(s%m==m-1 && getenv("DBG")) fprintf(stderr,"  col %d ncur=%ld rec=%d\n",s/m,ncur,recording);
+    if(!recording && s%m==m-1) save_ckpt(s+1);
+    if(recording && s==recend && stop_after_record) break;
   }
-  @<Iterate the SpMV out to column $N$@>;
-  @<Report and cross\--check@>;
+  spmv_run(Next, 1);
   return c0;
+}
+@#
+/* SpMV from the (built or loaded) tables out to column |Nto|. |crosscheck|
+   compares against the direct |cnt| where both are valid. Uses |cnt2| scratch. */
+int build_extract(int mm,int Wb){ return run_periodic(mm,Wb,Wb); }
+void spmv_run(int Nto,int crosscheck){
+  int i; memset(cnt2,0,sizeof(cnt2));
+  @<Iterate the SpMV out to column $N$@>;
+  { int good=1,cc;
+    if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=recend_col_g;cc++) if(cnt[cc*m]!=cnt2[cc*m]){ good=0;
+      fprintf(stderr,"MISMATCH c=%d direct=%llu spmv=%llu\n",cc,cnt[cc*m],cnt2[cc*m]); }
+    for(cc=1;cc<=Nto;cc++){ u64 val = cc<=recend_col_g? cnt[cc*m] : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>recend_col_g?"  (SpMV)":""); }
+    if(crosscheck) fprintf(stderr,"%s\n", good?"SpMV matches direct":"SpMV MISMATCH"); }
 }
 
 @ @<Iterate the SpMV out to column $N$@>=
 { u64* v=malloc(nstate[0]*sizeof(u64)); memcpy(v,seedv,nstate[0]*sizeof(u64));
-  int basecol=c0+1;
-  while(basecol<=Next){ int L;
+  int basecol=c0_g+1;
+  while(basecol<=Nto){ int L;
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
       for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]=(cnt2[idx]+v[comps[L][e].src]*comps[L][e].mult)%MODP; }
       u64* vn=calloc(nstate[L+1],sizeof(u64));
       for(e=0;e<nedge[L];e++) vn[edges[L][e].dst]=(vn[edges[L][e].dst]+v[edges[L][e].src]*edges[L][e].c)%MODP;
       free(v); v=vn; }
-    basecol+=period; }
+    basecol+=period_g; }
   free(v); }
 
 @ @<Report and cross\--check@>=
@@ -300,7 +378,18 @@ No arguments: self\--checks (direct sweep vs known values, and SpMV vs direct).
 |dualham m Wb N|: build to column $W_b$, then extend to column~$N$ by SpMV.
 
 @<Main@>=
+void spmv_run(int Nto,int crosscheck);
+int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
+  if(argc>=5 && !strcmp(argv[1],"build")){ /* build m Wb file [ckpt] : build+extract, dump tables */
+    stop_after_record=1; if(argc>=6) ckpt_path=argv[5];
+    build_extract(atoi(argv[2]),atoi(argv[3])); dump_tables(argv[4]); return 0; }
+  if(argc==5 && !strcmp(argv[1],"resume")){ /* resume ckpt Wb file : continue a build */
+    stop_after_record=1; resume_from=load_ckpt(argv[2]); ckpt_path=argv[2];
+    build_extract(m,atoi(argv[3])); dump_tables(argv[4]); return 0; }
+  if(argc==4 && !strcmp(argv[1],"run")){ /* run file Nto : load tables, SpMV */
+    if(!load_tables(argv[2])){ fprintf(stderr,"cannot load %s\n",argv[2]); return 1; }
+    spmv_run(atoi(argv[3]),0); return 0; }
   if(argc==4){ run_periodic(atoi(argv[1]),atoi(argv[2]),atoi(argv[3])); return 0; }
   struct{int m,Wb,c;u64 e;} chk[]={{5,12,4,82},{5,12,6,18784},{5,12,8,18061054ULL},
     {5,12,9,264895640ULL},{5,12,10,7886117822ULL},{7,6,4,6378},{6,7,6,3318960},{0,0,0,0}};
