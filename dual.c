@@ -45,10 +45,16 @@ int keyof(int q,unsigned char*key){ int i;
 /* cycle just closed: valid completion iff the apex is inner (in the loop) and no
    OUTER cells remain (every subpath consumed into the one cycle). Inner frontier
    cells are fine (covered, still awaiting their unprocessed neighbours). */
-u64 completion(int q,int apexpos,u64 w){ int i;
+/* A cycle through the apex has closed.  It is a valid Hamiltonian m'-path iff
+   the covered (inner) cells are exactly the contiguous prefix {0..m'-1} and every
+   other board frontier cell is bare.  Returns m' (>0) to credit, else 0. */
+int completion_mp(int q,int apexpos,int*frn,int s){ int k,mp=s+1;
   if(mate[apexpos]!=-1) return 0;
-  for(i=0;i<q;i++) if(mate[i]>=0) return 0;  /* an outer cell => partial cover */
-  return w; }
+  k=0;
+  while(k<q && frn[k]!=V && mate[k]==-1 && frn[k]==mp){ mp++; k++; }
+  for(;k<q;k++){ if(frn[k]==V) continue; if(mate[k]!=-2) return 0; } /* rest bare */
+  return mp;
+}
 
 unsigned char*kp; long kcap,kuse; typedef struct{long off;int len;u64 w;}Rec; Rec*rc; long nr,rcap;
 unsigned char*cb;
@@ -112,14 +118,14 @@ int main(int argc,char*argv[]){
         for(a=0;a<rr;a++){
           build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
           if(add_derived(STEMP,nbr[a])){ nl=keyof(qnew,nk); emit(nk,nl,w); }
-          else if(cycle) cnt[s+1]+=completion(qnew,apexnew,w);
+          else if(cycle){ int mp=completion_mp(qnew,apexnew,frnew,s); if(mp) cnt[mp]+=w; }
         }
       } else { /* need==2 */
         for(a=0;a<rr;a++)for(b=a+1;b<rr;b++){
           build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
-          if(!add_derived(STEMP,nbr[a])){ if(cycle) cnt[s+1]+=completion(qnew,apexnew,w); continue; }
+          if(!add_derived(STEMP,nbr[a])){ if(cycle){ int mp=completion_mp(qnew,apexnew,frnew,s); if(mp) cnt[mp]+=w; } continue; }
           if(add_derived(STEMP,nbr[b])){ nl=keyof(qnew,nk); emit(nk,nl,w); }
-          else if(cycle) cnt[s+1]+=completion(qnew,apexnew,w);
+          else if(cycle){ int mp=completion_mp(qnew,apexnew,frnew,s); if(mp) cnt[mp]+=w; }
         }
       }
     }
