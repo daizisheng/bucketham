@@ -157,6 +157,7 @@ void sort_reduce(int s,int rec){
 #pragma omp parallel for schedule(dynamic,1)
   for(t=0;t<NT;t++) if(tnr[t]) qsort_r(trc[t],tnr[t],sizeof(Rec),rcmp_r,tkp[t]);
   long tot=0; for(t=0;t<NT;t++) tot+=tnr[t];
+  if(getenv("SRDBG")){ int q5; fprintf(stderr,"trc[0] after qsort_r:"); for(q5=0;q5<10&&q5<tnr[0];q5++){ Rec*R=&trc[0][q5]; int kn=0,z; for(z=0;z<R->len;z++) kn=(kn<<8)|(tkp[0]+R->off)[z]; fprintf(stderr," %d",kn);} fprintf(stderr,"\n"); }
   int P=NT*8; if(P>NRNG) P=NRNG; if(P<1) P=1; if((long)P>tot && tot>0) P=(int)tot;
   int S=P*8; if((long)S>tot) S=(int)tot;
   static Samp* samp=0; static long sampcap=0; if(sampcap<S+1){ sampcap=S+1; samp=xrealloc(samp,sampcap*sizeof(Samp)); }
@@ -164,8 +165,10 @@ void sort_reduce(int s,int rec){
   for(t=0;t<NT && tot>0;t++){ long nt=tnr[t]; if(nt==0) continue; long take=(long)((double)S*nt/tot); if(take<1) take=1; long j;
     for(j=0;j<take && sc<S;j++){ long idx=(long)((double)j*nt/take); if(idx>=nt) idx=nt-1; Rec*R=&trc[t][idx]; samp[sc].k=tkp[t]+R->off; samp[sc].len=R->len; sc++; } }
   S=(int)sc; qsort(samp,S,sizeof(Samp),sampcmp);
+  if(getenv("SRDBG")){ int q4; fprintf(stderr,"samp after qsort (S=%d):",S); for(q4=0;q4<S&&q4<16;q4++){ int kn=0,z; for(z=0;z<samp[q4].len;z++) kn=(kn<<8)|samp[q4].k[z]; fprintf(stderr," %d",kn);} fprintf(stderr,"\n"); }
   static Samp spl[NRNG]; int np=0, p;
   for(p=1;p<P;p++){ long si=(long)((double)p*S/P); if(si>=S) si=S-1; if(S>0) spl[np++]=samp[si]; }
+  if(getenv("SRDBG")){ fprintf(stderr,"P=%d np=%d tot=%ld  splitters:",P,np,tot); int pp2; for(pp2=0;pp2<np&&pp2<12;pp2++){ int kn=0,z; for(z=0;z<spl[pp2].len;z++) kn=(kn<<8)|spl[pp2].k[z]; fprintf(stderr," %d",kn);} fprintf(stderr,"\n"); }
   for(t=0;t<NT;t++){ bnd[t][0]=0; bnd[t][P]=tnr[t];
     for(p=0;p<np;p++){ long lo=0,hi=tnr[t]; while(lo<hi){ long mid=(lo+hi)/2; Rec*R=&trc[t][mid];
       if(keycmp(tkp[t]+R->off,R->len,spl[p].k,spl[p].len)<0) lo=mid+1; else hi=mid; } bnd[t][p+1]=lo; } }
@@ -190,6 +193,7 @@ void sort_reduce(int s,int rec){
     }
     if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); rw_[r]=xrealloc(rw_[r],rgcap[r]*sizeof(u64)); } rkl[r][rcnt[r]]=curlen; rw_[r][rcnt[r]]=sw; rcnt[r]++; }
   }
+  if(getenv("SRDBG")){ int rr3; for(rr3=0;rr3<P&&rr3<12;rr3++){ int fk=-1,lk=-1,z; if(rcnt[rr3]>0){ fk=0; for(z=0;z<rkl[rr3][0];z++) fk=(fk<<8)|rk[rr3][z]; long lo2=0,q; for(q=0;q<rcnt[rr3]-1;q++) lo2+=rkl[rr3][q]; lk=0; for(z=0;z<rkl[rr3][rcnt[rr3]-1];z++) lk=(lk<<8)|rk[rr3][lo2+z]; } fprintf(stderr,"  range %d: rcnt=%ld first=%d last=%d\n",rr3,rcnt[rr3],fk,lk); } }
   static long base[NRNG+1], kbase[NRNG+1], ebase[NRNG+1];
   base[0]=kbase[0]=ebase[0]=0;
   for(r=0;r<P;r++){ base[r+1]=base[r]+rcnt[r]; kbase[r+1]=kbase[r]+rkuse[r]; ebase[r+1]=ebase[r]+rne[r]; }
@@ -436,6 +440,38 @@ void spmv_run(int Nto,int crosscheck){
   for(cc=1;cc<=Next;cc++){ u64 val = cc<=Wb? cnt[cc*m] : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>Wb?"  (SpMV)":""); }
   fprintf(stderr,"%s\n", good?"SpMV matches direct":"SpMV MISMATCH"); }
 
+@ A fast standalone correctness harness for |sort_reduce|: fill the thread pools
+with |N| synthetic records whose keys encode one of |K| numbers in |L| big-endian
+bytes (so lexicographic == numeric) with random small weights, run the merge, and
+compare the reduced (key,weight) output against a direct per-number weight sum.
+Exercises many duplicate keys spread across threads and splitter ranges.
+
+@<Subroutines@>=
+void tpush(int t,unsigned char*key,int len,u64 w){
+  if(tkuse[t]+len>tkcap[t]){tkcap[t]=tkcap[t]*2+len+65536;tkp[t]=xrealloc(tkp[t],tkcap[t]);}
+  if(tnr[t]>=trcap[t]){trcap[t]=trcap[t]*2+65536;trc[t]=xrealloc(trc[t],trcap[t]*sizeof(Rec));}
+  memcpy(tkp[t]+tkuse[t],key,len); trc[t][tnr[t]].off=tkuse[t]; trc[t][tnr[t]].len=len;
+  trc[t][tnr[t]].w=w; trc[t][tnr[t]].src=(long)tnr[t]; tkuse[t]+=len; tnr[t]++; }
+int test_merge(long N,int L,int K,int rec){
+  int NT=omp_get_max_threads(), t; long j; unsigned long seed=88172645463325252UL;
+#define RND (seed^=seed<<13, seed^=seed>>7, seed^=seed<<17, seed)
+  u64* ref=xcalloc(K,sizeof(u64)); MODP=0;
+  for(j=0;j<N;j++){ unsigned long r=RND; int kn=(int)(r%K); u64 w=1+(RND%9);
+    unsigned char key[64]; int i; for(i=0;i<L;i++) key[i]=((unsigned long)kn>>(8*(L-1-i)))&0xff;
+    int t2=(int)(RND%NT); tpush(t2,key,L,w); ref[kn]=ref[kn]+w; }
+  reccomp_n=0; recording=1; reclev=0; nstate[0]=0; sort_reduce(0,rec);
+  /* compare */
+  int bad=0; long i; long prev=-1;
+  for(i=0;i<ncur;i++){ unsigned char*k=curkp+curoff[i]; long kn=0,z; for(z=0;z<curkl[i];z++) kn=(kn<<8)|k[z];
+    if(curkl[i]!=L){ printf("len mismatch\n"); bad++; break; }
+    if(kn<=prev){ printf("NOT SORTED at %ld: kn=%ld prev=%ld\n",i,kn,prev); bad++; break; } prev=kn;
+    if((u64)curw[i]!=ref[kn]){ printf("WEIGHT mismatch kn=%ld got=%llu ref=%llu\n",kn,(u64)curw[i],ref[kn]); bad++; if(bad>5)break; } }
+  long present=0; for(j=0;j<K;j++) if(ref[j]) present++;
+  if(ncur!=present){ printf("COUNT mismatch: ncur=%ld distinct-present=%ld\n",ncur,present); bad++; }
+  printf("test N=%ld L=%d K=%d rec=%d NT=%d: %s (ncur=%ld)\n",N,L,K,rec,NT,bad?"FAIL":"OK",ncur);
+  free(ref); return bad; }
+
+@ 
 @* Main.
 No arguments: self\--checks (direct sweep vs known values, and SpMV vs direct).
 |dualham m Wb N|: build to column $W_b$, then extend to column~$N$ by SpMV.
@@ -443,7 +479,9 @@ No arguments: self\--checks (direct sweep vs known values, and SpMV vs direct).
 @<Main@>=
 void spmv_run(int Nto,int crosscheck);
 int build_extract(int mm,int Wb);
+int test_merge(long,int,int,int);
 int main(int argc,char*argv[]){
+  if(argc>=2 && !strcmp(argv[1],"test")){ return test_merge(argc>2?atol(argv[2]):200000, argc>3?atoi(argv[3]):3, argc>4?atoi(argv[4]):700, argc>5?atoi(argv[5]):0); }
   { long ram=sysconf(_SC_PHYS_PAGES)*(long)sysconf(_SC_PAGE_SIZE); long cap=(long)(ram*0.85);
     char*e=getenv("MEMCAP_GB"); if(e) cap=atol(e)*(1L<<30);
     struct rlimit rl={cap,cap}; setrlimit(RLIMIT_AS,&rl);
