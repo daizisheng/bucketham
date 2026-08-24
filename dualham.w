@@ -200,11 +200,20 @@ void sort_reduce(int s,int rec){
   for(r=0;r<P;r++){ long off=kbase[r], j; memcpy(curkp+kbase[r], rk[r], rkuse[r]);
     for(j=0;j<rcnt[r];j++){ curkl[base[r]+j]=rkl[r][j]; curw[base[r]+j]=rw_[r][j]; curoff[base[r]+j]=off; off+=rkl[r][j]; } }
   for(t=0;t<NT;t++){ tnr[t]=0; tkuse[t]=0; }
-  if(rec){ Edge* eb=xmalloc((ebase[P]+1)*sizeof(Edge)); long enb=0; long o=0,pp;
-    for(r=0;r<P;r++){ long j; for(j=0;j<rne[r];j++){ eb[enb]=re[r][j]; eb[enb].dst += base[r]; enb++; } }
-    qsort(eb,enb,sizeof(Edge),ecmp);
-    for(pp=0;pp<enb;){ long q2=pp+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[pp].src&&eb[q2].dst==eb[pp].dst){cc++;q2++;} eb[o]=eb[pp]; eb[o].c=cc; o++; pp=q2; }
-    edges[reclev]=xrealloc(eb,(o+1)*sizeof(Edge)); nedge[reclev]=o;
+  if(rec){ static long rne2[NRNG], eb2[NRNG+1]; int r2;
+    /* coalesce each range's edges IN PLACE (parallel), giving global dsts; ranges
+       hold disjoint, ordered dst ranges, so concatenating them is already globally
+       (dst,src)-sorted -- no big duplicate array, no serial global sort. */
+#pragma omp parallel for schedule(dynamic,1)
+    for(r2=0;r2<P;r2++){ long j; for(j=0;j<rne[r2];j++) re[r2][j].dst += base[r2];
+      qsort(re[r2],rne[r2],sizeof(Edge),ecmp);
+      long o=0,pp; for(pp=0;pp<rne[r2];){ long q2=pp+1; u64 cc=1; while(q2<rne[r2]&&re[r2][q2].src==re[r2][pp].src&&re[r2][q2].dst==re[r2][pp].dst){cc++;q2++;} re[r2][o]=re[r2][pp]; re[r2][o].c=cc; o++; pp=q2; } rne2[r2]=o; }
+    long tote=0; for(r2=0;r2<P;r2++) tote+=rne2[r2];
+    eb2[0]=0; for(r2=0;r2<P;r2++) eb2[r2+1]=eb2[r2]+rne2[r2];
+    Edge* eb=xmalloc((tote+1)*sizeof(Edge));
+#pragma omp parallel for schedule(dynamic,1)
+    for(r2=0;r2<P;r2++) memcpy(eb+eb2[r2], re[r2], rne2[r2]*sizeof(Edge));
+    edges[reclev]=eb; nedge[reclev]=tote;
     nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur;
     comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp)); ncomp[reclev]=reccomp_n;
     reclev++; }
