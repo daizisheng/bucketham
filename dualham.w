@@ -191,8 +191,8 @@ int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int stop_after_record=0; int direct_cov_g=0;
 static u64 colfp_g[4096]; const char* ckpt_path=0;   /* per-column build checkpoint */
 u64* seedv; long seedn;
-Comp reccomp_buf[1<<20]; long reccomp_n;
-int ecmp(const void*A,const void*B){ const Edge*a=A,*b=B; if(a->src!=b->src) return a->src-b->src; return a->dst-b->dst; }
+Comp* reccomp_buf; long reccomp_n, reccomp_cap;
+int ecmp(const void*A,const void*B){ const Edge*a=A,*b=B; if(a->dst!=b->dst) return a->dst-b->dst; return a->src-b->src; }
 
 @ @<Subroutines@>=
 void build_bmate(int*omate,int qold){ int i;
@@ -222,7 +222,7 @@ transition scratch (|mate|, |bmate|, |cycle|, |STEMP|) is |threadprivate|; each
 thread emits into its own pool; |cnt| is updated in a critical section.
 
 @<Expand every state at cell |s|@>=
-#pragma omp parallel for if(!rec) schedule(dynamic,32)
+#pragma omp parallel for schedule(dynamic,32)
 for(si=0;si<ncur;si++){
   int i,a,b,nl,deg,need,mp; unsigned char*ok=curkp+curoff[si]; int okl=curkl[si]; u64 w=curw[si];
   int omate[MAXF]; unsigned char nk[MAXF];
@@ -242,7 +242,8 @@ for(si=0;si<ncur;si++){
 {
 #pragma omp critical
   { cnt[mp]=(cnt[mp]+w)%MODP;
-    if(rec){ reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; } }
+    if(rec){ if(reccomp_n>=reccomp_cap){ reccomp_cap=reccomp_cap*2+(1<<20); reccomp_buf=realloc(reccomp_buf,reccomp_cap*sizeof(Comp)); }
+      reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; } }
 }
 
 @ The sort and reduce run across the per-thread pools in parallel (see
@@ -362,7 +363,13 @@ void spmv_run(int Nto,int crosscheck){
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
       for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]=(cnt2[idx]+v[comps[L][e].src]*comps[L][e].mult)%MODP; }
       u64* vn=calloc(nstate[L+1],sizeof(u64));
-      for(e=0;e<nedge[L];e++) vn[edges[L][e].dst]=(vn[edges[L][e].dst]+v[edges[L][e].src]*edges[L][e].c)%MODP;
+      { long ne=nedge[L]; int NT=omp_get_max_threads(),tt; static long spl[NTMAX+1];
+        spl[0]=0; spl[NT]=ne;
+        for(tt=1;tt<NT;tt++){ long g=(long)((double)tt*ne/NT);
+          while(g>0&&g<ne&&edges[L][g].dst==edges[L][g-1].dst) g++; spl[tt]=g; }
+#pragma omp parallel for schedule(dynamic,1)
+        for(tt=0;tt<NT;tt++){ long e2; for(e2=spl[tt];e2<spl[tt+1];e2++){ int d=edges[L][e2].dst;
+          vn[d]=(vn[d]+v[edges[L][e2].src]*edges[L][e2].c)%MODP; } } }
       free(v); v=vn; }
     basecol+=period_g; }
   free(v); }
