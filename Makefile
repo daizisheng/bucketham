@@ -6,8 +6,16 @@
 CC     = gcc
 CFLAGS = -O2 -Wall
 
+all: bucketham dualham
+
 bucketham: bucketham.c
 	$(CC) $(CFLAGS) -o $@ $<
+
+dualham: dualham.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+dualham.c: dualham.w
+	ctangle dualham.w
 
 bucketham.c: bucketham.w
 	ctangle bucketham.w
@@ -24,4 +32,4 @@ clean:
 	rm -f bucketham bucketham.c bucketham.tex bucketham.pdf \
 	      bucketham.idx bucketham.scn bucketham.toc bucketham.log
 
-.PHONY: pdf check clean
+.PHONY: all pdf check clean

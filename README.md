@@ -32,21 +32,35 @@ Needs a C compiler and (for `pdf`) a CWEB + TeX installation
 ./bucketham s 5 11     # stabilization diagnostic (translation-invariant states)
 ```
 
+## Programs
+
+- **`dualham.w`** — the current engine. A **dual-frontier** transfer (track the
+  *unprocessed* boundary + an apex vertex; open tours = cycles through the apex),
+  whose state counts match Knuth's `DYNAHAM` exactly. It sweeps once to count
+  open `m×c` for every `c`, detects the periodic transfer once the frontier
+  stabilizes, extracts the integer edge tables, and then reaches far columns by
+  a **sparse matrix–vector product** — `build the stable transfer once, iterate
+  cheaply`. Validated: open `5×c` matches known values, and the SpMV agrees with
+  the direct sweep and extends correctly beyond the built range.
+- `bucketham.w` — the first version (tracks *processed* cells). Correct but its
+  mid-column state set is ~10× larger; kept for reference. `dual.c`,
+  `periodic.c` are the C prototypes the CWEB was derived and validated from.
+
+```sh
+make dualham          # tangle + compile the dual engine
+./dualham             # self-checks
+./dualham 5 20 30     # build 5×n to col 20, then SpMV-extend counts to col 30
+```
+
 ## Status
 
-Validated:
+Validated: dual state machine (state counts match DYNAHAM); whole-table sweep;
+translation-invariant key + period detection; periodic edge-table extraction;
+SpMV extension. Next: OpenMP over the bucket sort and SpMV; modular/CRT (or
+double) arithmetic for large `n`; the `m=8` run.
 
-- **State machine** (frontier canon/decode, edge splice, freeze accounting):
-  open `m×n` correct for `m = 4,5,6,7` — built-in checks, exact agreement with
-  known open 5×n values, and transpose symmetry `open(m,n)=open(n,m)` computed
-  via a different vertex order.
-- **Whole-table sweep**: open `m×c` for every `c` from one strip run.
-- **Translation-invariant key** + stabilization detection (the prerequisite for
-  extracting the reusable periodic transfer).
-
-In progress: tightening the canonical form to the minimal frontier code;
-extracting the per-substep edge tables and the parallel sparse matrix-vector
-product that scales to large `n`; OpenMP; modular/CRT exact arithmetic.
+Background: this targets reliable `a,b` in the `8×n` open-tour asymptotics
+`(a+b·n)·ρ^n`, ρ ≈ 526.458 — Knuth *TAOCP* Pre-Fascicle 8A, Exercise 210.
 
 ## Background
 
