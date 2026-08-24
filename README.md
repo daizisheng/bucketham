@@ -58,8 +58,15 @@ make dualham                     # tangle + compile the dual engine
 ./dualham run t.bin 300              # reload tables, SpMV open 8xc out to col 300
 ```
 
-Arithmetic is mod `2^31-1` (no overflow at any `n`); run several primes and CRT
-for exact values. The build (`expand` + `sort/reduce`) is OpenMP-parallel.
+Weights are exact `u64` by default; pass a prime to `run` for one residue, and
+`crt.py` combines several residues into exact big integers:
+
+```sh
+./dualham build 6 12 t6.bin ck6.bin   # build once (prime-agnostic edges)
+python3 crt.py ./dualham t6.bin 6 20 8 # 8 primes -> exact open 6xc to col 20
+```
+
+The build (`expand` + `sort/reduce` + recording) and the SpMV are OpenMP-parallel.
 
 ## Status
 

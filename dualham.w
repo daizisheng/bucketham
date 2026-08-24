@@ -149,7 +149,7 @@ void sort_reduce(int s,int rec){
     int same=(curlen==rlen && memcmp(curkp+curpos,rkey,rlen)==0);
     if(!same){ if(curlen>=0){ curw[k]=sw; k++; }
       curpos=use; memcpy(curkp+use,rkey,rlen); curoff[k]=use; curkl[k]=rlen; use+=rlen; curlen=rlen; sw=0; }
-    sw=(sw+R->w)%MODP;
+    sw=red(sw+R->w);
     if(rec){ eb[enb].src=(int)R->src; eb[enb].dst=(int)k; eb[enb].c=1; enb++; }
     idx[mt]++;
     if(idx[mt]>=tnr[mt]) heap[0]=heap[--hn];
@@ -177,7 +177,8 @@ and the completion contributions for this level.
 @<Globals@>=
 unsigned char*curkp; long*curoff; int*curkl; u64*curw; long ncur;
 u64 cnt[1<<16];
-u64 MODP=2147483647ULL;   /* 2^31-1, Mersenne prime; run several for CRT */
+u64 MODP=0;   /* 0 = exact u64; set to a prime for one CRT residue */
+static inline u64 red(u64 x){ return MODP? x%MODP : x; }
 int qnew, posS, apexnew, STEMP; int bmate[MAXF], o2n[MAXF];
 #pragma omp threadprivate(bmate,STEMP)
 @#
@@ -241,7 +242,7 @@ for(si=0;si<ncur;si++){
 @ @<Credit completion@>=
 {
 #pragma omp critical
-  { cnt[mp]=(cnt[mp]+w)%MODP;
+  { cnt[mp]=red(cnt[mp]+w);
     if(rec){ if(reccomp_n>=reccomp_cap){ reccomp_cap=reccomp_cap*2+(1<<20); reccomp_buf=realloc(reccomp_buf,reccomp_cap*sizeof(Comp)); }
       reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; } }
 }
@@ -348,11 +349,12 @@ int run_periodic(int mm,int Wb,int Next){
 int build_extract(int mm,int Wb){ return run_periodic(mm,Wb,Wb); }
 void spmv_run(int Nto,int crosscheck){
   int i; memset(cnt2,0,sizeof(cnt2));
+  if(MODP){ long j; for(j=0;j<seedn;j++) seedv[j]=red(seedv[j]); }
   @<Iterate the SpMV out to column $N$@>;
   { int good=1,cc;
     if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=direct_cov_g;cc++) if(cnt[cc*m]!=cnt2[cc*m]){ good=0;
       fprintf(stderr,"MISMATCH c=%d direct=%llu spmv=%llu\n",cc,cnt[cc*m],cnt2[cc*m]); }
-    for(cc=1;cc<=Nto;cc++){ u64 val = cc<=recend_col_g? cnt[cc*m] : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>recend_col_g?"  (SpMV)":""); }
+    for(cc=1;cc<=Nto;cc++){ u64 val = cc<=recend_col_g? red(cnt[cc*m]) : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>recend_col_g?"  (SpMV)":""); }
     if(crosscheck) fprintf(stderr,"%s\n", good?"SpMV matches direct":"SpMV MISMATCH"); }
 }
 
@@ -361,7 +363,7 @@ void spmv_run(int Nto,int crosscheck){
   int basecol=c0_g+1;
   while(basecol<=Nto){ int L;
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
-      for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]=(cnt2[idx]+v[comps[L][e].src]*comps[L][e].mult)%MODP; }
+      for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]=red(cnt2[idx]+v[comps[L][e].src]*comps[L][e].mult); }
       u64* vn=calloc(nstate[L+1],sizeof(u64));
       { long ne=nedge[L]; int NT=omp_get_max_threads(),tt; static long spl[NTMAX+1];
         spl[0]=0; spl[NT]=ne;
@@ -369,7 +371,7 @@ void spmv_run(int Nto,int crosscheck){
           while(g>0&&g<ne&&edges[L][g].dst==edges[L][g-1].dst) g++; spl[tt]=g; }
 #pragma omp parallel for schedule(dynamic,1)
         for(tt=0;tt<NT;tt++){ long e2; for(e2=spl[tt];e2<spl[tt+1];e2++){ int d=edges[L][e2].dst;
-          vn[d]=(vn[d]+v[edges[L][e2].src]*edges[L][e2].c)%MODP; } } }
+          vn[d]=red(vn[d]+v[edges[L][e2].src]*edges[L][e2].c); } } }
       free(v); v=vn; }
     basecol+=period_g; }
   free(v); }
@@ -395,8 +397,9 @@ int main(int argc,char*argv[]){
   if(argc==5 && !strcmp(argv[1],"resume")){ /* resume ckpt Wb file : continue a build */
     stop_after_record=1; resume_from=load_ckpt(argv[2]); ckpt_path=argv[2];
     build_extract(m,atoi(argv[3])); dump_tables(argv[4]); return 0; }
-  if(argc==4 && !strcmp(argv[1],"run")){ /* run file Nto : load tables, SpMV */
+  if(argc>=4 && !strcmp(argv[1],"run")){ /* run file Nto [prime] : load tables, SpMV (mod prime if given) */
     if(!load_tables(argv[2])){ fprintf(stderr,"cannot load %s\n",argv[2]); return 1; }
+    if(argc>=5) MODP=strtoull(argv[4],0,10);
     spmv_run(atoi(argv[3]),0); return 0; }
   if(argc==4){ run_periodic(atoi(argv[1]),atoi(argv[2]),atoi(argv[3])); return 0; }
   struct{int m,Wb,c;u64 e;} chk[]={{5,12,4,82},{5,12,6,18784},{5,12,8,18061054ULL},
@@ -404,7 +407,7 @@ int main(int argc,char*argv[]){
   int i,bad=0,lm=0,lw=0;
   for(i=0;chk[i].m;i++){
     if(chk[i].m!=lm||chk[i].Wb!=lw){ run_periodic(chk[i].m,chk[i].Wb,chk[i].Wb); lm=chk[i].m; lw=chk[i].Wb; }
-    u64 g=cnt[chk[i].c*chk[i].m], e=chk[i].e%MODP;
+    u64 g=cnt[chk[i].c*chk[i].m], e=red(chk[i].e);
     printf("open %dx%d = %llu  exp(mod p) %llu  %s\n",chk[i].m,chk[i].c,g,e,g==e?"OK":"FAIL");
     if(g!=e) bad++; }
   printf("%s\n",bad?"SOME FAILED":"ALL OK"); return bad?1:0;
