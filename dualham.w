@@ -21,6 +21,7 @@ the sorted state set repeats with some small period once we are in the bulk,
 which is exactly what makes the transfer periodic and the SpMV possible.
 
 @c
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -118,6 +119,45 @@ void merge_pools(void){ int t; long r; nr=0; kuse=0;
     memcpy(kp+kuse,tkp[t]+R->off,R->len);
     rc[nr].off=kuse; rc[nr].len=R->len; rc[nr].w=R->w; rc[nr].src=R->src; kuse+=R->len; nr++; }
     tnr[t]=0; tkuse[t]=0; } }
+@#
+int rcmp_r(const void*A,const void*B,void*arg){ unsigned char*base=arg; const Rec*a=A,*b=B;
+  int l=a->len<b->len?a->len:b->len; int d=memcmp(base+a->off,base+b->off,l); return d?d:a->len-b->len; }
+@#
+/* sort each thread's records in parallel, then merge+reduce across them in one
+   pass (keeping global sort order so periodic ids stay consistent), capturing
+   the integer edge table when recording. */
+long in_ncur_g;
+void sort_reduce(int s,int rec){
+  int NT=omp_get_max_threads(), t; long tot=0;
+#pragma omp parallel for schedule(dynamic,1)
+  for(t=0;t<NT;t++) if(tnr[t]) qsort_r(trc[t],tnr[t],sizeof(Rec),rcmp_r,tkp[t]);
+  for(t=0;t<NT;t++) tot+=tnr[t];
+  long tbytes=0; for(t=0;t<NT;t++) tbytes+=tkuse[t];
+  curoff=realloc(curoff,(tot+1)*sizeof(long)); curkl=realloc(curkl,(tot+1)*sizeof(int));
+  curw=realloc(curw,(tot+1)*sizeof(u64)); curkp=realloc(curkp,tbytes+1);
+  static long idx[NTMAX]; for(t=0;t<NT;t++) idx[t]=0;
+  Edge* eb=0; long enb=0; if(rec) eb=malloc((tot+1)*sizeof(Edge));
+  long k=0,use=0;
+  for(;;){ int mt=-1;
+    for(t=0;t<NT;t++) if(idx[t]<tnr[t]){ if(mt<0){mt=t;} else {
+      Rec*A=&trc[t][idx[t]],*B=&trc[mt][idx[mt]]; int l=A->len<B->len?A->len:B->len;
+      int d=memcmp(tkp[t]+A->off,tkp[mt]+B->off,l); if(d<0||(d==0&&A->len<B->len)) mt=t; } }
+    if(mt<0) break;
+    Rec*M=&trc[mt][idx[mt]]; unsigned char*mkey=tkp[mt]+M->off; int mlen=M->len;
+    memcpy(curkp+use,mkey,mlen); curoff[k]=use; curkl[k]=mlen; u64 sw=0;
+    for(t=0;t<NT;t++){ while(idx[t]<tnr[t]){ Rec*R=&trc[t][idx[t]];
+      if(R->len==mlen && memcmp(tkp[t]+R->off,mkey,mlen)==0){ sw=(sw+R->w)%MODP;
+        if(rec){ eb[enb].src=(int)R->src; eb[enb].dst=(int)k; eb[enb].c=1; enb++; } idx[t]++; }
+      else break; } }
+    curw[k]=sw; use+=mlen; k++; }
+  ncur=k;
+  for(t=0;t<NT;t++){ tnr[t]=0; tkuse[t]=0; }
+  if(rec){ long o=0,p; qsort(eb,enb,sizeof(Edge),ecmp);
+    for(p=0;p<enb;){ long q2=p+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[p].src&&eb[q2].dst==eb[p].dst){cc++;q2++;} eb[o]=eb[p]; eb[o].c=cc; o++; p=q2; }
+    edges[reclev]=realloc(eb,(o+1)*sizeof(Edge)); nedge[reclev]=o;
+    nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur;
+    comps[reclev]=malloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp)); ncomp[reclev]=reccomp_n;
+    reclev++; } }
 
 @* The transfer step.
 The bucket holds states as (key,weight) over the previous frontier. To place
@@ -161,7 +201,7 @@ void run_step(int s,int rec){
   int nbr[16],rr=0; nbr[rr++]=apexnew;
   for(i=0;i<ND[s];i++){ int w=NB[s][i]; if(w>s && ifrnew[w]>=0) nbr[rr++]=ifrnew[w]; }
   for(i=0;i<qold;i++) o2n[i]=(frold[i]==s)?-1:ifrnew[frold[i]];
-  nr=0; kuse=0; reccomp_n=0;
+  in_ncur_g=ncur; reccomp_n=0;
   @<Expand every state at cell |s|@>;
   @<Sort, reduce, and (if recording) capture the edge table@>;
 }
@@ -195,28 +235,11 @@ for(si=0;si<ncur;si++){
     if(rec){ reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; } }
 }
 
-@ The reduce also, when recording, resolves each emitted record's destination to
-its bucket index, giving integer edges $(\hbox{src},\hbox{dst},\hbox{coeff})$.
+@ The sort and reduce run across the per-thread pools in parallel (see
+|sort_reduce|); |in_ncur_g| records the input level size for the edge table.
 
 @<Sort, reduce, and (if recording) capture the edge table@>=
-{ merge_pools(); cb=kp; qsort(rc,nr,sizeof(Rec),rcmp);
-  curoff=realloc(curoff,(nr+1)*sizeof(long)); curkl=realloc(curkl,(nr+1)*sizeof(int));
-  curw=realloc(curw,(nr+1)*sizeof(u64)); curkp=realloc(curkp,kuse+1);
-  Edge* eb=0; long enb=0; if(rec) eb=malloc((nr+1)*sizeof(Edge));
-  long k=0,use=0,ri;
-  for(ri=0;ri<nr;){ long j=ri+1; u64 sw=rc[ri].w;
-    if(rec){ long t; for(t=ri;t<nr;t++){ if(t>ri && !(rc[t].len==rc[ri].len && memcmp(kp+rc[t].off,kp+rc[ri].off,rc[ri].len)==0)) break;
-        eb[enb].src=(int)rc[t].src; eb[enb].dst=(int)k; eb[enb].c=1; enb++; } }
-    while(j<nr&&rc[j].len==rc[ri].len&&memcmp(kp+rc[j].off,kp+rc[ri].off,rc[ri].len)==0){sw=(sw+rc[j].w)%MODP;j++;}
-    memcpy(curkp+use,kp+rc[ri].off,rc[ri].len); curoff[k]=use; curkl[k]=rc[ri].len; curw[k]=sw; use+=rc[ri].len; k++; ri=j; }
-  ncur=k;
-  if(rec){ long o=0,p; qsort(eb,enb,sizeof(Edge),ecmp);
-    for(p=0;p<enb;){ long q2=p+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[p].src&&eb[q2].dst==eb[p].dst){cc++;q2++;} eb[o]=eb[p]; eb[o].c=cc; o++; p=q2; }
-    edges[reclev]=realloc(eb,(o+1)*sizeof(Edge)); nedge[reclev]=o;
-    nstate[reclev]=in_ncur; nstate[reclev+1]=ncur;
-    comps[reclev]=malloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp)); ncomp[reclev]=reccomp_n;
-    reclev++; }
-}
+sort_reduce(s,rec);
 
 @* Driver: build, extract the period, then SpMV.
 Sweep an $m\times W_b$ strip; when the boundary key\--set (fingerprinted) repeats
