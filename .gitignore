@@ -1,0 +1,13 @@
+# deploy key — NEVER commit
+deploy_key_bucketham
+deploy_key_bucketham.pub
+# build artifacts
+bucketham
+*.o
+*.idx
+*.scn
+*.toc
+*.log
+*.out
+*.dvi
+core
