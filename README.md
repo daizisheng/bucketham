@@ -67,6 +67,9 @@ python3 crt.py ./dualham t6.bin 6 20 8 # 8 primes -> exact open 6xc to col 20
 ```
 
 The build (`expand` + `sort/reduce` + recording) and the SpMV are OpenMP-parallel.
+The process **self-caps** its address space at 85% of RAM (override with
+`MEMCAP_GB=N`) and every allocation is checked, so a run exits gracefully on
+memory exhaustion and can never trigger the kernel OOM killer.
 
 ## Status
 

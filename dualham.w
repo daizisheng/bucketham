@@ -26,6 +26,8 @@ which is exactly what makes the transfer periodic and the SpMV possible.
 #include <stdlib.h>
 #include <string.h>
 #include <omp.h>
+#include <sys/resource.h>
+#include <unistd.h>
 @#
 @<Types@>@;
 @<Globals@>@;
@@ -49,6 +51,15 @@ int NB[64*64][8], ND[64*64];
 static const int KR[8]={-2,-2,-1,-1,1,1,2,2};
 static const int KC[8]={-1,1,-2,2,-2,2,-1,1};
 int fr[MAXF], ifrb[64*64+2];
+
+@ All large allocations go through checked wrappers: on failure (e.g. hitting a
+|ulimit -v| cap) they print and |exit| gracefully, so a run can never provoke
+the kernel's OOM killer.
+
+@<Subroutines@>=
+void* xmalloc(size_t n){ void*p=malloc(n); if(!p&&n){ fprintf(stderr,"OOM: malloc %zu bytes failed\n",n); exit(3); } return p; }
+void* xrealloc(void*q,size_t n){ void*p=realloc(q,n); if(!p&&n){ fprintf(stderr,"OOM: realloc %zu bytes failed\n",n); exit(3); } return p; }
+void* xcalloc(size_t a,size_t b){ void*p=calloc(a,b); if(!p&&a&&b){ fprintf(stderr,"OOM: calloc %zu*%zu failed\n",a,b); exit(3); } return p; }
 
 @ @<Subroutines@>=
 void build_board(void){ int r,c,k; V=m*n;
@@ -108,14 +119,14 @@ int rcmp(const void*A,const void*B){ const Rec*a=A,*b=B; int l=a->len<b->len?a->
 @ @<Subroutines@>=
 void emit(unsigned char*key,int len,u64 w,long src){
   int t=omp_get_thread_num();
-  if(tkuse[t]+len>tkcap[t]){tkcap[t]=tkcap[t]*2+len+65536;tkp[t]=realloc(tkp[t],tkcap[t]);}
-  if(tnr[t]>=trcap[t]){trcap[t]=trcap[t]*2+65536;trc[t]=realloc(trc[t],trcap[t]*sizeof(Rec));}
+  if(tkuse[t]+len>tkcap[t]){tkcap[t]=tkcap[t]*2+len+65536;tkp[t]=xrealloc(tkp[t],tkcap[t]);}
+  if(tnr[t]>=trcap[t]){trcap[t]=trcap[t]*2+65536;trc[t]=xrealloc(trc[t],trcap[t]*sizeof(Rec));}
   memcpy(tkp[t]+tkuse[t],key,len); trc[t][tnr[t]].off=tkuse[t]; trc[t][tnr[t]].len=len;
   trc[t][tnr[t]].w=w; trc[t][tnr[t]].src=src; tkuse[t]+=len; tnr[t]++; }
 void merge_pools(void){ int t; long r; nr=0; kuse=0;
   for(t=0;t<omp_get_max_threads();t++){ for(r=0;r<tnr[t];r++){ Rec*R=&trc[t][r];
-    if(kuse+R->len>kcap){kcap=kcap*2+R->len+65536;kp=realloc(kp,kcap);}
-    if(nr>=rcap){rcap=rcap*2+65536;rc=realloc(rc,rcap*sizeof(Rec));}
+    if(kuse+R->len>kcap){kcap=kcap*2+R->len+65536;kp=xrealloc(kp,kcap);}
+    if(nr>=rcap){rcap=rcap*2+65536;rc=xrealloc(rc,rcap*sizeof(Rec));}
     memcpy(kp+kuse,tkp[t]+R->off,R->len);
     rc[nr].off=kuse; rc[nr].len=R->len; rc[nr].w=R->w; rc[nr].src=R->src; kuse+=R->len; nr++; }
     tnr[t]=0; tkuse[t]=0; } }
@@ -127,16 +138,22 @@ int rcmp_r(const void*A,const void*B,void*arg){ unsigned char*base=arg; const Re
    pass (keeping global sort order so periodic ids stay consistent), capturing
    the integer edge table when recording. */
 long in_ncur_g;
+/* Merge the per-thread sorted lists with an NT-way heap directly into the
+   reduced output -- memory-efficient (no full sorted copy is materialized), so
+   it stays within RAM for large m. It is partly serial (the heap pops); a
+   splitter-based PARALLEL merge (partition the output by sampled splitters, then
+   merge each part independently) is the next optimization for m>=7 speed, but
+   the bucket-copy variant it replaces used ~2x the memory and could OOM. */
 void sort_reduce(int s,int rec){
   int NT=omp_get_max_threads(), t; long tot=0;
 #pragma omp parallel for schedule(dynamic,1)
   for(t=0;t<NT;t++) if(tnr[t]) qsort_r(trc[t],tnr[t],sizeof(Rec),rcmp_r,tkp[t]);
   for(t=0;t<NT;t++) tot+=tnr[t];
   long tbytes=0; for(t=0;t<NT;t++) tbytes+=tkuse[t];
-  curoff=realloc(curoff,(tot+1)*sizeof(long)); curkl=realloc(curkl,(tot+1)*sizeof(int));
-  curw=realloc(curw,(tot+1)*sizeof(u64)); curkp=realloc(curkp,tbytes+1);
+  curoff=xrealloc(curoff,(tot+1)*sizeof(long)); curkl=xrealloc(curkl,(tot+1)*sizeof(int));
+  curw=xrealloc(curw,(tot+1)*sizeof(u64)); curkp=xrealloc(curkp,tbytes+1);
   static long idx[NTMAX]; for(t=0;t<NT;t++) idx[t]=0;
-  Edge* eb=0; long enb=0; if(rec) eb=malloc((tot+1)*sizeof(Edge));
+  Edge* eb=0; long enb=0; if(rec) eb=xmalloc((tot+1)*sizeof(Edge));
   long k=0,use=0;
   static int heap[NTMAX]; int hn=0;
 #define HKEY(t) (tkp[t]+trc[t][idx[t]].off)
@@ -161,9 +178,9 @@ void sort_reduce(int s,int rec){
   for(t=0;t<NT;t++){ tnr[t]=0; tkuse[t]=0; }
   if(rec){ long o=0,p; qsort(eb,enb,sizeof(Edge),ecmp);
     for(p=0;p<enb;){ long q2=p+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[p].src&&eb[q2].dst==eb[p].dst){cc++;q2++;} eb[o]=eb[p]; eb[o].c=cc; o++; p=q2; }
-    edges[reclev]=realloc(eb,(o+1)*sizeof(Edge)); nedge[reclev]=o;
+    edges[reclev]=xrealloc(eb,(o+1)*sizeof(Edge)); nedge[reclev]=o;
     nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur;
-    comps[reclev]=malloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp)); ncomp[reclev]=reccomp_n;
+    comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp)); ncomp[reclev]=reccomp_n;
     reclev++; } }
 
 @* The transfer step.
@@ -243,7 +260,7 @@ for(si=0;si<ncur;si++){
 {
 #pragma omp critical
   { cnt[mp]=red(cnt[mp]+w);
-    if(rec){ if(reccomp_n>=reccomp_cap){ reccomp_cap=reccomp_cap*2+(1<<20); reccomp_buf=realloc(reccomp_buf,reccomp_cap*sizeof(Comp)); }
+    if(rec){ if(reccomp_n>=reccomp_cap){ reccomp_cap=reccomp_cap*2+(1<<20); reccomp_buf=xrealloc(reccomp_buf,reccomp_cap*sizeof(Comp)); }
       reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; } }
 }
 
@@ -274,9 +291,9 @@ int load_ckpt(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return -1; int n
   if(fread(&mm,sizeof(int),1,f)!=1) return -1; m=mm; fread(&nexts,sizeof(int),1,f);
   fread(cnt,sizeof(u64),1<<16,f); fread(colfp_g,sizeof(u64),4096,f);
   fread(&ncur,sizeof(long),1,f); fread(&kuse,sizeof(long),1,f);
-  curoff=realloc(curoff,(ncur+1)*sizeof(long)); curkl=realloc(curkl,(ncur+1)*sizeof(int)); curw=realloc(curw,(ncur+1)*sizeof(u64));
+  curoff=xrealloc(curoff,(ncur+1)*sizeof(long)); curkl=xrealloc(curkl,(ncur+1)*sizeof(int)); curw=xrealloc(curw,(ncur+1)*sizeof(u64));
   fread(curoff,sizeof(long),ncur,f); fread(curkl,sizeof(int),ncur,f); fread(curw,sizeof(u64),ncur,f);
-  { long kb; fread(&kb,sizeof(long),1,f); curkp=realloc(curkp,kb+1); fread(curkp,1,kb,f); }
+  { long kb; fread(&kb,sizeof(long),1,f); curkp=xrealloc(curkp,kb+1); fread(curkp,1,kb,f); }
   fclose(f); fprintf(stderr,"resumed build from %s at cell %d (col %d)\n",path,nexts,nexts/mm); return nexts; }
 
 @ @* Dumping and reloading the extracted tables.
@@ -297,10 +314,10 @@ void dump_tables(const char*path){ FILE*f=fopen(path,"wb"); int L;
   fclose(f); fprintf(stderr,"dumped tables to %s (period %d, c0 %d, %d levels)\n",path,period_g,c0_g,Plevs); }
 int load_tables(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return 0; int L,hdr[5];
   if(fread(hdr,sizeof(int),5,f)!=5) return 0; m=hdr[0]; period_g=hdr[1]; c0_g=hdr[2]; Plevs=hdr[3]; recend_col_g=hdr[4];
-  fread(&seedn,sizeof(long),1,f); seedv=malloc(seedn*sizeof(u64)); fread(seedv,sizeof(u64),seedn,f);
+  fread(&seedn,sizeof(long),1,f); seedv=xmalloc(seedn*sizeof(u64)); fread(seedv,sizeof(u64),seedn,f);
   fread(nstate,sizeof(long),Plevs+1,f);
-  for(L=0;L<Plevs;L++){ fread(&nedge[L],sizeof(long),1,f); edges[L]=malloc((nedge[L]+1)*sizeof(Edge)); fread(edges[L],sizeof(Edge),nedge[L],f);
-    fread(&ncomp[L],sizeof(long),1,f); comps[L]=malloc((ncomp[L]+1)*sizeof(Comp)); fread(comps[L],sizeof(Comp),ncomp[L],f); }
+  for(L=0;L<Plevs;L++){ fread(&nedge[L],sizeof(long),1,f); edges[L]=xmalloc((nedge[L]+1)*sizeof(Edge)); fread(edges[L],sizeof(Edge),nedge[L],f);
+    fread(&ncomp[L],sizeof(long),1,f); comps[L]=xmalloc((ncomp[L]+1)*sizeof(Comp)); fread(comps[L],sizeof(Comp),ncomp[L],f); }
   int nc; fread(&nc,sizeof(int),1,f); memset(cnt,0,sizeof(cnt)); fread(cnt,sizeof(u64),nc,f);
   fclose(f); return 1; }
 
@@ -316,7 +333,7 @@ covers ($c\ge c_0+3$), and the SpMV alone yields the columns past~$W_b$.
 int resume_from=0;
 void seed_bucket(void){ int i; int q=frontier_before(0);
   for(i=0;i<q;i++) mate[i]=-2; unsigned char key[MAXF]; int kl=keyof(q,key);
-  curkp=malloc(1<<20); curoff=malloc(sizeof(long)); curkl=malloc(sizeof(int)); curw=malloc(sizeof(u64));
+  curkp=xmalloc(1<<20); curoff=xmalloc(sizeof(long)); curkl=xmalloc(sizeof(int)); curw=xmalloc(sizeof(u64));
   memcpy(curkp,key,kl); curoff[0]=0; curkl[0]=kl; curw[0]=1; ncur=1; }
 @#
 u64 cnt2[1<<16];
@@ -326,7 +343,7 @@ int run_periodic(int mm,int Wb,int Next){
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
   int c0=-1,period=0,recstart=-1,recend=-1;
   for(s=(resume_from>0?resume_from:0);s<V;s++){
-    if(recording && s==recstart){ seedn=ncur; seedv=malloc(ncur*sizeof(u64)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0; }
+    if(recording && s==recstart){ seedn=ncur; seedv=xmalloc(ncur*sizeof(u64)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0; }
     run_step(s, recording && s>=recstart && s<=recend);
     if(s%m==m-1){ c=s/m; u64 h=1469598103934665603ULL; long t;
       for(t=0;t<ncur;t++){ unsigned char*kk=curkp+curoff[t]; int L=curkl[t],z; for(z=0;z<L;z++){ h^=kk[z]; h*=1099511628211ULL; } h^=0x9e; h*=1099511628211ULL; }
@@ -359,12 +376,12 @@ void spmv_run(int Nto,int crosscheck){
 }
 
 @ @<Iterate the SpMV out to column $N$@>=
-{ u64* v=malloc(nstate[0]*sizeof(u64)); memcpy(v,seedv,nstate[0]*sizeof(u64));
+{ u64* v=xmalloc(nstate[0]*sizeof(u64)); memcpy(v,seedv,nstate[0]*sizeof(u64));
   int basecol=c0_g+1;
   while(basecol<=Nto){ int L;
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
       for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]=red(cnt2[idx]+v[comps[L][e].src]*comps[L][e].mult); }
-      u64* vn=calloc(nstate[L+1],sizeof(u64));
+      u64* vn=xcalloc(nstate[L+1],sizeof(u64));
       { long ne=nedge[L]; int NT=omp_get_max_threads(),tt; static long spl[NTMAX+1];
         spl[0]=0; spl[NT]=ne;
         for(tt=1;tt<NT;tt++){ long g=(long)((double)tt*ne/NT);
@@ -391,6 +408,10 @@ No arguments: self\--checks (direct sweep vs known values, and SpMV vs direct).
 void spmv_run(int Nto,int crosscheck);
 int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
+  { long ram=sysconf(_SC_PHYS_PAGES)*(long)sysconf(_SC_PAGE_SIZE); long cap=(long)(ram*0.85);
+    char*e=getenv("MEMCAP_GB"); if(e) cap=atol(e)*(1L<<30);
+    struct rlimit rl={cap,cap}; setrlimit(RLIMIT_AS,&rl);
+    fprintf(stderr,"self memory cap: %.0f GB (set MEMCAP_GB to override)\n",cap/1073741824.0); }
   if(argc>=5 && !strcmp(argv[1],"build")){ /* build m Wb file [ckpt] : build+extract, dump tables */
     stop_after_record=1; if(argc>=6) ckpt_path=argv[5]; if(argc>=7) ckpt_every=atoi(argv[6]);
     build_extract(atoi(argv[2]),atoi(argv[3])); dump_tables(argv[4]); return 0; }
