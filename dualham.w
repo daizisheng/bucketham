@@ -188,7 +188,7 @@ Edge* edges[MAXLEV]; long nedge[MAXLEV];
 Comp* comps[MAXLEV]; long ncomp[MAXLEV];
 long nstate[MAXLEV+1]; int Plevs;
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
-int stop_after_record=0;
+int stop_after_record=0; int direct_cov_g=0;
 static u64 colfp_g[4096]; const char* ckpt_path=0;   /* per-column build checkpoint */
 u64* seedv; long seedn;
 Comp reccomp_buf[1<<20]; long reccomp_n;
@@ -337,6 +337,7 @@ int run_periodic(int mm,int Wb,int Next){
     if(!recording && s%m==m-1) save_ckpt(s+1);
     if(recording && s==recend && stop_after_record) break;
   }
+  direct_cov_g = stop_after_record ? recend_col_g : n;
   spmv_run(Next, 1);
   return c0;
 }
@@ -348,7 +349,7 @@ void spmv_run(int Nto,int crosscheck){
   int i; memset(cnt2,0,sizeof(cnt2));
   @<Iterate the SpMV out to column $N$@>;
   { int good=1,cc;
-    if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=recend_col_g;cc++) if(cnt[cc*m]!=cnt2[cc*m]){ good=0;
+    if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=direct_cov_g;cc++) if(cnt[cc*m]!=cnt2[cc*m]){ good=0;
       fprintf(stderr,"MISMATCH c=%d direct=%llu spmv=%llu\n",cc,cnt[cc*m],cnt2[cc*m]); }
     for(cc=1;cc<=Nto;cc++){ u64 val = cc<=recend_col_g? cnt[cc*m] : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>recend_col_g?"  (SpMV)":""); }
     if(crosscheck) fprintf(stderr,"%s\n", good?"SpMV matches direct":"SpMV MISMATCH"); }
