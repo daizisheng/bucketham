@@ -85,15 +85,40 @@ static void* mem_watcher(void*arg){ (void)arg;
       fprintf(stderr,"\nMEMORY CAP: RSS %.1f GB exceeds cap %.1f GB -- exiting"
         " gracefully (raise MEMCAP_GB to allow more)\n",
         r/1073741824.0, mem_cap_bytes/1073741824.0); fflush(stderr); _exit(3); }
-    usleep(500000); }
+    usleep(300000); }
   return 0; }
+/* The binding limit is the tightest of physical RAM and the cgroup |memory.max|
+   over our cgroup-v2 hierarchy: a container/slice cap is often well below
+   physical RAM, and the kernel's cgroup OOM killer fires at THAT limit, not the
+   physical one -- so a watcher that only knew physical RAM would be OOM-killed
+   before it ever tripped. */
+static long cgroup_mem_limit(void){
+  char line[4096],*p; char path[4096]={0};
+  FILE*f=fopen("/proc/self/cgroup","r"); if(!f) return -1;
+  while(fgets(line,sizeof line,f)) if((p=strstr(line,"0::"))){ p+=3;
+    char*nl=strchr(p,'\n'); if(nl)*nl=0; snprintf(path,sizeof path,"%s",p); break; }
+  fclose(f); if(!path[0]) return -1;
+  long lim=-1; char base[4200]; snprintf(base,sizeof base,"/sys/fs/cgroup%s",path);
+  int up; for(up=0; up<16; up++){
+    char mm[4300]; snprintf(mm,sizeof mm,"%s/memory.max",base);
+    FILE*g=fopen(mm,"r");
+    if(g){ char v[64]={0}; if(fgets(v,sizeof v,g) && strncmp(v,"max",3)){
+      long x=atol(v); if(x>0 && (lim<0||x<lim)) lim=x; } fclose(g); }
+    if(!strcmp(base,"/sys/fs/cgroup")) break;
+    char*s=strrchr(base,'/'); if(!s) break; *s=0;
+    if(strlen(base) < strlen("/sys/fs/cgroup")) break; }
+  return lim; }
 void start_mem_watcher(void){
   long ram=sysconf(_SC_PHYS_PAGES)*(long)sysconf(_SC_PAGE_SIZE);
-  mem_cap_bytes=(long)(ram*0.85);
+  long cg=cgroup_mem_limit();
+  long avail = (cg>0 && cg<ram) ? cg : ram;   /* tightest binding limit */
+  mem_cap_bytes=(long)(avail*0.85);
   char*e=getenv("MEMCAP_GB"); if(e) mem_cap_bytes=atol(e)*(1L<<30);
   pthread_t th; pthread_create(&th,0,mem_watcher,0); pthread_detach(th);
-  fprintf(stderr,"self memory cap: %.0f GB RSS (set MEMCAP_GB to override)\n",
-    mem_cap_bytes/1073741824.0); }
+  fprintf(stderr,"self memory cap: %.0f GB RSS (%s%s; set MEMCAP_GB to override)\n",
+    mem_cap_bytes/1073741824.0,
+    (cg>0&&cg<ram)?"cgroup-limited":"85% of physical",
+    (cg>0&&cg<ram)?"" : ""); }
 
 @ @<Subroutines@>=
 void build_board(void){ int r,c,k; V=m*n;
