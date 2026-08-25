@@ -275,11 +275,11 @@ void sort_reduce(int s,int rec){
       rne2[r2]=o2; }
     long o=0; for(r2=0;r2<P;r2++) o+=rne2[r2];
     nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur; nedge[reclev]=o; ncomp[reclev]=reccomp_n;
-    if(stream_edges){  /* stream each range's edges straight to disk, freeing none extra */
-      if(!rec_fp){ rec_fp=fopen(rec_path,"wb"); if(!rec_fp){ fprintf(stderr,"cannot open %s\n",rec_path); exit(3); } }
+    if(stream_edges){  /* append this level to the open table file (prefix already written) */
       fwrite(&o,sizeof(long),1,rec_fp);
       for(r2=0;r2<P;r2++) if(rne2[r2]) fwrite(re[r2],sizeof(Edge),rne2[r2],rec_fp);
       fwrite(&reccomp_n,sizeof(long),1,rec_fp); fwrite(reccomp_buf,sizeof(Comp),reccomp_n,rec_fp);
+      if(ferror(rec_fp)){ fprintf(stderr,"disk write error on %s (out of space?)\n",rec_path); exit(3); }
       edges[reclev]=0; comps[reclev]=0;
     } else {  /* in-process: consolidate into one array for the in-RAM SpMV */
       Edge* eb=xmalloc((o+1)*sizeof(Edge)); long enb=0;
@@ -315,7 +315,7 @@ long nstate[MAXLEV+1]; int Plevs;
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int direct_valid_col_g;             /* direct |cnt| is exact for columns $\le$ this */
 int stop_after_record=0; int direct_cov_g=0;
-int stream_edges=0; FILE* rec_fp=0; char rec_path[4096];  /* out-of-core recording */
+int stream_edges=0; FILE* rec_fp=0; char rec_path[4096]; long nstate_off=0;  /* out-of-core recording */
 static u64 colfp_g[4096]; const char* ckpt_path=0; int ckpt_every=4;   /* checkpoint every K columns */
 u64* seedv; long seedn;
 Comp* reccomp_buf; long reccomp_n, reccomp_cap;
@@ -413,14 +413,24 @@ self\--contained, so we dump them to disk. A later run reloads them and does onl
 the cheap SpMV --- and a build that dies can be re\--run without touching the SpMV.
 
 @<Subroutines@>=
-void dump_tables(const char*path){ FILE*f=fopen(path,"wb"); int L;
+void dump_tables(const char*path){ int L;
+  if(stream_edges && rec_fp){
+    /* The prefix (hdr, seed, nstate placeholder) and every level are already on
+       disk (written during recording). Append cnt, then patch the two fields not
+       known until now: hdr[5]=direct_valid_col_g and the real nstate[]. No copy,
+       no second file -- so the table needs disk for its own size only. */
+    int nc=(direct_valid_col_g+1)*m; fwrite(&nc,sizeof(int),1,rec_fp); fwrite(cnt,sizeof(u64),nc,rec_fp);
+    fflush(rec_fp);
+    fseek(rec_fp,5L*sizeof(int),SEEK_SET); fwrite(&direct_valid_col_g,sizeof(int),1,rec_fp);
+    fseek(rec_fp,nstate_off,SEEK_SET); fwrite(nstate,sizeof(long),Plevs+1,rec_fp);
+    if(ferror(rec_fp)){ fprintf(stderr,"disk write error on %s (out of space?)\n",path); exit(3); }
+    fclose(rec_fp); rec_fp=0;
+    fprintf(stderr,"dumped tables to %s (period %d, c0 %d, %d levels)\n",path,period_g,c0_g,Plevs); return; }
+  FILE*f=fopen(path,"wb");   /* non-streaming fallback (edges held in RAM) */
   int hdr[6]={m,period_g,c0_g,Plevs,recend_col_g,direct_valid_col_g}; fwrite(hdr,sizeof(int),6,f);
   fwrite(&seedn,sizeof(long),1,f); fwrite(seedv,sizeof(u64),seedn,f);
   fwrite(nstate,sizeof(long),Plevs+1,f);
-  if(stream_edges && rec_fp){  /* levels already on disk (rec_path) in the same format; copy them in */
-    fclose(rec_fp); rec_fp=0; FILE*g=fopen(rec_path,"rb");
-    if(g){ char*buf=xmalloc(1<<20); size_t k; while((k=fread(buf,1,1<<20,g))>0) fwrite(buf,1,k,f); free(buf); fclose(g); remove(rec_path); } }
-  else for(L=0;L<Plevs;L++){ fwrite(&nedge[L],sizeof(long),1,f); fwrite(edges[L],sizeof(Edge),nedge[L],f);
+  for(L=0;L<Plevs;L++){ fwrite(&nedge[L],sizeof(long),1,f); fwrite(edges[L],sizeof(Edge),nedge[L],f);
     fwrite(&ncomp[L],sizeof(long),1,f); fwrite(comps[L],sizeof(Comp),ncomp[L],f); }
   int nc=(direct_valid_col_g+1)*m; fwrite(&nc,sizeof(int),1,f); fwrite(cnt,sizeof(u64),nc,f);
   fclose(f); fprintf(stderr,"dumped tables to %s (period %d, c0 %d, %d levels)\n",path,period_g,c0_g,Plevs); }
@@ -456,7 +466,13 @@ int run_periodic(int mm,int Wb,int Next){
   int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
   int cand_p=0,cand_c=-1;   /* pending (unconfirmed) period candidate */
   for(s=(resume_from>0?resume_from:0);s<V;s++){
-    if(recording && s==recstart){ seedn=ncur; seedv=xmalloc(ncur*sizeof(u64)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0; }
+    if(recording && s==recstart){ seedn=ncur; seedv=xmalloc(ncur*sizeof(u64)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0;
+      if(stream_edges){  /* write the table's fixed prefix now; levels stream in after; patch at dump */
+        rec_fp=fopen(rec_path,"wb"); if(!rec_fp){ fprintf(stderr,"cannot open %s\n",rec_path); exit(3); }
+        int hdr[6]={m,period_g,c0_g,Plevs,recend_col_g,0};   /* direct_valid_col_g patched at dump */
+        fwrite(hdr,sizeof(int),6,rec_fp); fwrite(&seedn,sizeof(long),1,rec_fp); fwrite(seedv,sizeof(u64),seedn,rec_fp);
+        nstate_off=ftell(rec_fp); { long z[MAXLEV+1]; int L; for(L=0;L<=Plevs;L++) z[L]=0; fwrite(z,sizeof(long),Plevs+1,rec_fp); }
+        if(ferror(rec_fp)){ fprintf(stderr,"disk write error on %s (out of space?)\n",rec_path); exit(3); } } }
     run_step(s, recording && s>=recstart && s<=recend);
     if(s%m==m-1){ c=s/m; u64 h=1469598103934665603ULL; long t;
       for(t=0;t<ncur;t++){ unsigned char*kk=curkp+curoff[t]; int L=curkl[t],z; for(z=0;z<L;z++){ h^=kk[z]; h*=1099511628211ULL; } h^=0x9e; h*=1099511628211ULL; }
@@ -571,11 +587,11 @@ int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
   start_mem_watcher();
   if(argc>=5 && !strcmp(argv[1],"build")){ /* build m Wb file [ckpt] : build+extract, dump tables */
-    stop_after_record=1; stream_edges=1; snprintf(rec_path,sizeof rec_path,"%s.lvl",argv[4]);
+    stop_after_record=1; stream_edges=1; snprintf(rec_path,sizeof rec_path,"%s",argv[4]);
     if(argc>=6) ckpt_path=argv[5]; if(argc>=7) ckpt_every=atoi(argv[6]);
     build_extract(atoi(argv[2]),atoi(argv[3])); dump_tables(argv[4]); return 0; }
   if(argc==5 && !strcmp(argv[1],"resume")){ /* resume ckpt Wb file : continue a build */
-    stop_after_record=1; stream_edges=1; snprintf(rec_path,sizeof rec_path,"%s.lvl",argv[4]);
+    stop_after_record=1; stream_edges=1; snprintf(rec_path,sizeof rec_path,"%s",argv[4]);
     resume_from=load_ckpt(argv[2]); ckpt_path=argv[2];
     build_extract(m,atoi(argv[3])); dump_tables(argv[4]); return 0; }
   if(argc>=4 && !strcmp(argv[1],"run")){ /* run file Nto [prime] : load tables, SpMV (mod prime if given) */
