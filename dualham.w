@@ -22,6 +22,7 @@ which is exactly what makes the transfer periodic and the SpMV possible.
 
 @c
 #define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -316,6 +317,7 @@ int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int direct_valid_col_g;             /* direct |cnt| is exact for columns $\le$ this */
 int stop_after_record=0; int direct_cov_g=0;
 int stream_edges=0; FILE* rec_fp=0; char rec_path[4096]; long nstate_off=0;  /* out-of-core recording */
+int stream_spmv=0; FILE* tbl_fp=0; long lev_edge_off[MAXLEV];  /* out-of-core SpMV (edges streamed from disk) */
 static u64 colfp_g[4096]; const char* ckpt_path=0; int ckpt_every=4;   /* checkpoint every K columns */
 u64* seedv; long seedn;
 Comp* reccomp_buf; long reccomp_n, reccomp_cap;
@@ -438,10 +440,14 @@ int load_tables(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return 0; int 
   if(fread(hdr,sizeof(int),6,f)!=6) return 0; m=hdr[0]; period_g=hdr[1]; c0_g=hdr[2]; Plevs=hdr[3]; recend_col_g=hdr[4]; direct_valid_col_g=hdr[5];
   fread(&seedn,sizeof(long),1,f); seedv=xmalloc(seedn*sizeof(u64)); fread(seedv,sizeof(u64),seedn,f);
   fread(nstate,sizeof(long),Plevs+1,f);
-  for(L=0;L<Plevs;L++){ fread(&nedge[L],sizeof(long),1,f); edges[L]=xmalloc((nedge[L]+1)*sizeof(Edge)); fread(edges[L],sizeof(Edge),nedge[L],f);
-    fread(&ncomp[L],sizeof(long),1,f); comps[L]=xmalloc((ncomp[L]+1)*sizeof(Comp)); fread(comps[L],sizeof(Comp),ncomp[L],f); }
+  /* Stream edges from disk (tables can be >RAM, e.g. 100GB for m=7): keep the
+     small comps[] in RAM, remember each level's edge offset, skip the edges. */
+  for(L=0;L<Plevs;L++){ fread(&nedge[L],sizeof(long),1,f);
+    lev_edge_off[L]=ftello(f); fseeko(f,(off_t)nedge[L]*sizeof(Edge),SEEK_CUR);
+    fread(&ncomp[L],sizeof(long),1,f); comps[L]=xmalloc((ncomp[L]+1)*sizeof(Comp)); fread(comps[L],sizeof(Comp),ncomp[L],f);
+    edges[L]=0; }
   int nc; fread(&nc,sizeof(int),1,f); memset(cnt,0,sizeof(cnt)); fread(cnt,sizeof(u64),nc,f);
-  fclose(f); return 1; }
+  tbl_fp=f; stream_spmv=1; return 1; }   /* keep file open for edge streaming */
 
 @ @* Driver: build, extract the period, then SpMV.
 Sweep an $m\times W_b$ strip; when the boundary key\--set (fingerprinted) repeats
@@ -559,13 +565,25 @@ if(c0_g>=0 && Plevs>0){ u64* v=xmalloc(nstate[0]*sizeof(u64)); memcpy(v,seedv,ns
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
       for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; cnt2[idx]=red(cnt2[idx]+v[comps[L][e].src]*comps[L][e].mult); }
       u64* vn=xcalloc(nstate[L+1],sizeof(u64));
-      { long ne=nedge[L]; int NT=omp_get_max_threads(),tt; static long spl[NTMAX+1];
-        spl[0]=0; spl[NT]=ne;
-        for(tt=1;tt<NT;tt++){ long g=(long)((double)tt*ne/NT);
-          while(g>0&&g<ne&&edges[L][g].dst==edges[L][g-1].dst) g++; spl[tt]=g; }
+      { long ne=nedge[L];
+        if(stream_spmv){  /* out-of-core: stream this level's edges from disk in chunks */
+          fseeko(tbl_fp,lev_edge_off[L],SEEK_SET);
+          static Edge* buf=0; static long bufcap=0; long CH=1L<<20;
+          if(bufcap<CH){ bufcap=CH; buf=xrealloc(buf,bufcap*sizeof(Edge)); }
+          long done=0;
+          while(done<ne){ long chunk=ne-done; if(chunk>CH) chunk=CH;
+            if((long)fread(buf,sizeof(Edge),chunk,tbl_fp)!=chunk){ fprintf(stderr,"table edge read error\n"); exit(3); }
+            long e2; for(e2=0;e2<chunk;e2++){ int d=buf[e2].dst; vn[d]=red(vn[d]+v[buf[e2].src]*buf[e2].c); }
+            done+=chunk; }
+        } else {          /* in-RAM: dst-partitioned parallel apply */
+          int NT=omp_get_max_threads(),tt; static long spl[NTMAX+1];
+          spl[0]=0; spl[NT]=ne;
+          for(tt=1;tt<NT;tt++){ long g=(long)((double)tt*ne/NT);
+            while(g>0&&g<ne&&edges[L][g].dst==edges[L][g-1].dst) g++; spl[tt]=g; }
 #pragma omp parallel for schedule(dynamic,1)
-        for(tt=0;tt<NT;tt++){ long e2; for(e2=spl[tt];e2<spl[tt+1];e2++){ int d=edges[L][e2].dst;
-          vn[d]=red(vn[d]+v[edges[L][e2].src]*edges[L][e2].c); } } }
+          for(tt=0;tt<NT;tt++){ long e2; for(e2=spl[tt];e2<spl[tt+1];e2++){ int d=edges[L][e2].dst;
+            vn[d]=red(vn[d]+v[edges[L][e2].src]*edges[L][e2].c); } }
+        } }
       free(v); v=vn; }
     basecol+=period_g; }
   free(v); }
