@@ -259,18 +259,32 @@ void sort_reduce(int s,int rec){
   for(r=0;r<P;r++){ long off=kbase[r], j; memcpy(curkp+kbase[r], rk[r], rkuse[r]);
     for(j=0;j<rcnt[r];j++){ curkl[base[r]+j]=rkl[r][j]; curw[base[r]+j]=rw_[r][j]; curoff[base[r]+j]=off; off+=rkl[r][j]; } }
   for(t=0;t<NT;t++){ tnr[t]=0; tkuse[t]=0; }
-  if(rec){ Edge* eb=xmalloc((ebase[P]+1)*sizeof(Edge)); long enb=0; long o=0,pp;
-    for(r=0;r<P;r++){ long j; for(j=0;j<rne[r];j++){ eb[enb]=re[r][j]; eb[enb].dst += base[r]; enb++; } }
-    qsort(eb,enb,sizeof(Edge),ecmp);
-    for(pp=0;pp<enb;){ long q2=pp+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[pp].src&&eb[q2].dst==eb[pp].dst){cc++;q2++;} eb[o]=eb[pp]; eb[o].c=cc; o++; pp=q2; }
+  if(rec){ int r2; static long rne2[NRNG];
+    /* Coalesce each range's edges IN PLACE and globalize dst -- parallel, no
+       global consolidation buffer. All edges to a given dst live in one range
+       (its key does), so per-range coalescing equals global coalescing; and the
+       ranges hold disjoint, dst-ordered blocks, so concatenating them is already
+       globally (dst,src)-sorted -- byte-identical to a global sort+coalesce, at
+       half the peak edge memory (no |eb| copy) and cheaper (P small sorts). */
+#pragma omp parallel for schedule(dynamic,1)
+    for(r2=0;r2<P;r2++){ long pp,o2=0;
+      if(rne[r2]>1) qsort(re[r2],rne[r2],sizeof(Edge),ecmp);
+      for(pp=0;pp<rne[r2];){ long q2=pp+1; u64 cc=1;
+        while(q2<rne[r2] && re[r2][q2].src==re[r2][pp].src && re[r2][q2].dst==re[r2][pp].dst){cc++;q2++;}
+        re[r2][o2]=re[r2][pp]; re[r2][o2].c=cc; re[r2][o2].dst += base[r2]; o2++; pp=q2; }
+      rne2[r2]=o2; }
+    long o=0; for(r2=0;r2<P;r2++) o+=rne2[r2];
     nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur; nedge[reclev]=o; ncomp[reclev]=reccomp_n;
-    if(stream_edges){  /* write this level to disk in the on-disk level format, free RAM */
+    if(stream_edges){  /* stream each range's edges straight to disk, freeing none extra */
       if(!rec_fp){ rec_fp=fopen(rec_path,"wb"); if(!rec_fp){ fprintf(stderr,"cannot open %s\n",rec_path); exit(3); } }
-      fwrite(&o,sizeof(long),1,rec_fp); fwrite(eb,sizeof(Edge),o,rec_fp);
+      fwrite(&o,sizeof(long),1,rec_fp);
+      for(r2=0;r2<P;r2++) if(rne2[r2]) fwrite(re[r2],sizeof(Edge),rne2[r2],rec_fp);
       fwrite(&reccomp_n,sizeof(long),1,rec_fp); fwrite(reccomp_buf,sizeof(Comp),reccomp_n,rec_fp);
-      free(eb); edges[reclev]=0; comps[reclev]=0;
-    } else {
-      edges[reclev]=xrealloc(eb,(o+1)*sizeof(Edge));
+      edges[reclev]=0; comps[reclev]=0;
+    } else {  /* in-process: consolidate into one array for the in-RAM SpMV */
+      Edge* eb=xmalloc((o+1)*sizeof(Edge)); long enb=0;
+      for(r2=0;r2<P;r2++){ long j; for(j=0;j<rne2[r2];j++) eb[enb++]=re[r2][j]; }
+      edges[reclev]=eb;
       comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
     }
     reclev++; }
