@@ -62,14 +62,24 @@ Weights are exact `u64` by default; pass a prime to `run` for one residue, and
 `crt.py` combines several residues into exact big integers:
 
 ```sh
-./dualham build 6 12 t6.bin ck6.bin   # build once (prime-agnostic edges)
-python3 crt.py ./dualham t6.bin 6 20 8 # 8 primes -> exact open 6xc to col 20
+./dualham build 6 20 t6.bin ck6.bin   # build once (Wb=20 >= stab col 9 + margin)
+python3 crt.py ./dualham t6.bin 6 30 8 # 8 primes -> exact open 6xc to col 30
 ```
 
 The build (`expand` + `sort/reduce` + recording) and the SpMV are OpenMP-parallel.
-The process **self-caps** its address space at 85% of RAM (override with
-`MEMCAP_GB=N`) and every allocation is checked, so a run exits gracefully on
-memory exhaustion and can never trigger the kernel OOM killer.
+A background watcher samples the **resident set size** and exits gracefully
+(`exit 3`) if it exceeds 85% of RAM (override with `MEMCAP_GB=N`); every allocation
+is checked too. Bounding physical memory (not the virtual address space) is what
+keeps a run from ever triggering the kernel OOM killer.
+
+**Choosing `Wb`.** `Wb` is the strip width the build sweeps to discover the
+periodic transfer. It must be a few columns wider than the stabilization column
+so the *recorded* columns sit in the bulk, away from the strip's right edge —
+concretely `Wb >= (stabilization col) + 4`. The build reports the stabilization
+column (`stable col C, period P (confirmed)`); if `Wb` is too small it prints
+`no confirmed period ... : direct counts only` and simply reports the directly
+counted columns (no extrapolation). For `m=6` (stabilizes ~col 9) use `Wb>=20`;
+larger `m` stabilize later and need a larger `Wb`.
 
 ## Status
 

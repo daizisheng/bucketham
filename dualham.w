@@ -28,6 +28,7 @@ which is exactly what makes the transfer periodic and the SpMV possible.
 #include <omp.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <pthread.h>
 @#
 @<Types@>@;
 @<Globals@>@;
@@ -52,14 +53,47 @@ static const int KR[8]={-2,-2,-1,-1,1,1,2,2};
 static const int KC[8]={-1,1,-2,2,-2,2,-1,1};
 int fr[MAXF], ifrb[64*64+2];
 
-@ All large allocations go through checked wrappers: on failure (e.g. hitting a
-|ulimit -v| cap) they print and |exit| gracefully, so a run can never provoke
-the kernel's OOM killer.
+@ All large allocations go through checked wrappers: on failure they print and
+|exit| gracefully, so a run can never provoke the kernel's OOM killer.
 
 @<Subroutines@>=
 void* xmalloc(size_t n){ void*p=malloc(n); if(!p&&n){ fprintf(stderr,"OOM: malloc %zu bytes failed\n",n); exit(3); } return p; }
 void* xrealloc(void*q,size_t n){ void*p=realloc(q,n); if(!p&&n){ fprintf(stderr,"OOM: realloc %zu bytes failed\n",n); exit(3); } return p; }
 void* xcalloc(size_t a,size_t b){ void*p=calloc(a,b); if(!p&&a&&b){ fprintf(stderr,"OOM: calloc %zu*%zu failed\n",a,b); exit(3); } return p; }
+
+@ To bound {\it physical\/} memory -- the resident set size, which is what
+actually triggers the kernel OOM killer -- a detached watcher thread samples the
+RSS and |_exit(3)|s gracefully if it exceeds the cap. We deliberately do {\bf not}
+cap the virtual address space with |RLIMIT_AS|: glibc arenas, per\--thread stacks,
+and |qsort|'s scratch |mmap| reserve far more virtual than resident memory, so an
+|RLIMIT_AS| cap makes those (non-|xmalloc|) allocations fail with a hard crash
+instead of a clean exit. RSS is the quantity that matters for OOM, and the largest
+single allocation here (an edge table, a few GB) fits comfortably inside the
+headroom between the 85\%-RAM cap and total RAM, so the 0.5\,s sampling never lets
+resident memory overshoot the machine.
+
+@<Globals@>=
+long mem_cap_bytes;
+
+@ @<Subroutines@>=
+static long rss_bytes(void){ FILE*f=fopen("/proc/self/statm","r"); if(!f) return 0;
+  long sz=0,res=0; if(fscanf(f,"%ld %ld",&sz,&res)!=2) res=0; fclose(f);
+  return res*(long)sysconf(_SC_PAGE_SIZE); }
+static void* mem_watcher(void*arg){ (void)arg;
+  for(;;){ long r=rss_bytes();
+    if(mem_cap_bytes>0 && r>mem_cap_bytes){
+      fprintf(stderr,"\nMEMORY CAP: RSS %.1f GB exceeds cap %.1f GB -- exiting"
+        " gracefully (raise MEMCAP_GB to allow more)\n",
+        r/1073741824.0, mem_cap_bytes/1073741824.0); fflush(stderr); _exit(3); }
+    usleep(500000); }
+  return 0; }
+void start_mem_watcher(void){
+  long ram=sysconf(_SC_PHYS_PAGES)*(long)sysconf(_SC_PAGE_SIZE);
+  mem_cap_bytes=(long)(ram*0.85);
+  char*e=getenv("MEMCAP_GB"); if(e) mem_cap_bytes=atol(e)*(1L<<30);
+  pthread_t th; pthread_create(&th,0,mem_watcher,0); pthread_detach(th);
+  fprintf(stderr,"self memory cap: %.0f GB RSS (set MEMCAP_GB to override)\n",
+    mem_cap_bytes/1073741824.0); }
 
 @ @<Subroutines@>=
 void build_board(void){ int r,c,k; V=m*n;
@@ -206,6 +240,7 @@ Edge* edges[MAXLEV]; long nedge[MAXLEV];
 Comp* comps[MAXLEV]; long ncomp[MAXLEV];
 long nstate[MAXLEV+1]; int Plevs;
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
+int direct_valid_col_g;             /* direct |cnt| is exact for columns $\le$ this */
 int stop_after_record=0; int direct_cov_g=0;
 static u64 colfp_g[4096]; const char* ckpt_path=0; int ckpt_every=4;   /* checkpoint every K columns */
 u64* seedv; long seedn;
@@ -305,15 +340,15 @@ the cheap SpMV --- and a build that dies can be re\--run without touching the Sp
 
 @<Subroutines@>=
 void dump_tables(const char*path){ FILE*f=fopen(path,"wb"); int L;
-  int hdr[5]={m,period_g,c0_g,Plevs,recend_col_g}; fwrite(hdr,sizeof(int),5,f);
+  int hdr[6]={m,period_g,c0_g,Plevs,recend_col_g,direct_valid_col_g}; fwrite(hdr,sizeof(int),6,f);
   fwrite(&seedn,sizeof(long),1,f); fwrite(seedv,sizeof(u64),seedn,f);
   fwrite(nstate,sizeof(long),Plevs+1,f);
   for(L=0;L<Plevs;L++){ fwrite(&nedge[L],sizeof(long),1,f); fwrite(edges[L],sizeof(Edge),nedge[L],f);
     fwrite(&ncomp[L],sizeof(long),1,f); fwrite(comps[L],sizeof(Comp),ncomp[L],f); }
-  int nc=(recend_col_g+1)*m; fwrite(&nc,sizeof(int),1,f); fwrite(cnt,sizeof(u64),nc,f);
+  int nc=(direct_valid_col_g+1)*m; fwrite(&nc,sizeof(int),1,f); fwrite(cnt,sizeof(u64),nc,f);
   fclose(f); fprintf(stderr,"dumped tables to %s (period %d, c0 %d, %d levels)\n",path,period_g,c0_g,Plevs); }
-int load_tables(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return 0; int L,hdr[5];
-  if(fread(hdr,sizeof(int),5,f)!=5) return 0; m=hdr[0]; period_g=hdr[1]; c0_g=hdr[2]; Plevs=hdr[3]; recend_col_g=hdr[4];
+int load_tables(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return 0; int L,hdr[6];
+  if(fread(hdr,sizeof(int),6,f)!=6) return 0; m=hdr[0]; period_g=hdr[1]; c0_g=hdr[2]; Plevs=hdr[3]; recend_col_g=hdr[4]; direct_valid_col_g=hdr[5];
   fread(&seedn,sizeof(long),1,f); seedv=xmalloc(seedn*sizeof(u64)); fread(seedv,sizeof(u64),seedn,f);
   fread(nstate,sizeof(long),Plevs+1,f);
   for(L=0;L<Plevs;L++){ fread(&nedge[L],sizeof(long),1,f); edges[L]=xmalloc((nedge[L]+1)*sizeof(Edge)); fread(edges[L],sizeof(Edge),nedge[L],f);
@@ -339,28 +374,77 @@ void seed_bucket(void){ int i; int q=frontier_before(0);
 u64 cnt2[1<<16];
 int run_periodic(int mm,int Wb,int Next){
   int i,s,c; m=mm; n=Wb; build_board(); memset(cnt2,0,sizeof(cnt2));
-  recording=0; reclev=0;
+  recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
-  int c0=-1,period=0,recstart=-1,recend=-1;
+  int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
+  int cand_p=0,cand_c=-1;   /* pending (unconfirmed) period candidate */
   for(s=(resume_from>0?resume_from:0);s<V;s++){
     if(recording && s==recstart){ seedn=ncur; seedv=xmalloc(ncur*sizeof(u64)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0; }
     run_step(s, recording && s>=recstart && s<=recend);
     if(s%m==m-1){ c=s/m; u64 h=1469598103934665603ULL; long t;
       for(t=0;t<ncur;t++){ unsigned char*kk=curkp+curoff[t]; int L=curkl[t],z; for(z=0;z<L;z++){ h^=kk[z]; h*=1099511628211ULL; } h^=0x9e; h*=1099511628211ULL; }
       colfp_g[c]=h;
-      if(c0<0){ if(c>=1&&colfp_g[c]==colfp_g[c-1]){period=1;c0=c;} else if(c>=2&&colfp_g[c]==colfp_g[c-2]){period=2;c0=c;}
-        if(c0>=0){ recstart=(c0+1)*m; recend=(c0+1+period)*m-1; Plevs=period*m; recording=1;
-          period_g=period; c0_g=c0; recend_col_g=c0+period;
-          fprintf(stderr,"stable col %d, period %d\n",c0,period); } } }
+      @<Detect and confirm the periodic column@>@; }
     if(s%m==m-1 && getenv("DBG")) fprintf(stderr,"  col %d ncur=%ld rec=%d\n",s/m,ncur,recording);
     if(!recording && s%m==m-1 && (s/m)%ckpt_every==0) save_ckpt(s+1);
-    if(recording && s==recend && stop_after_record) break;
+    if(recording && s==seam_break && stop_after_record) break;
   }
-  direct_cov_g = stop_after_record ? recend_col_g : n;
+  @<Finalize direct coverage and verify periodicity@>@;
+  direct_cov_g = stop_after_record ? direct_valid_col_g : n;
   spmv_run(Next, 1);
   return c0;
 }
-@#
+
+@ We commit to a period only once the boundary fingerprint has {\it repeated}: a
+lone match |colfp[c]==colfp[c-p]| can be a coincidence of the near\--boundary
+columns, so we hold it as a candidate and require it to persist one full period
+further before recording. That guarantees the recorded columns sit in the bulk,
+far enough from the strip's right edge that the transfer is stationary; a strip
+too narrow to contain a confirmed period never records, which the finalizer
+below turns into a clear diagnostic instead of a corrupt table.
+
+@<Detect and confirm the periodic column@>=
+if(c0<0){
+  if(cand_p==0){
+    if(c>=1 && colfp_g[c]==colfp_g[c-1]){ cand_p=1; cand_c=c; }
+    else if(c>=2 && colfp_g[c]==colfp_g[c-2]){ cand_p=2; cand_c=c; }
+  } else if(colfp_g[c]==colfp_g[c-cand_p]){
+    if(c-cand_c>=cand_p && c+cand_p+3<=n){ /* confirmed, with bulk room for recording+seam */
+      period=cand_p; c0=c; recstart=(c0+1)*m; recend=(c0+1+period)*m-1;
+      Plevs=period*m; recording=1; period_g=period; c0_g=c0; recend_col_g=c0+period;
+      seam_break=recend+3*m;              /* sweep a few extra columns (direct seam) */
+      fprintf(stderr,"stable col %d, period %d (confirmed)\n",c0,period);
+    }
+  } else { cand_p=0;                        /* candidate broke: restart search here */
+    if(c>=1 && colfp_g[c]==colfp_g[c-1]){ cand_p=1; cand_c=c; }
+    else if(c>=2 && colfp_g[c]==colfp_g[c-2]){ cand_p=2; cand_c=c; }
+  }
+}
+
+@ The direct sweep counts every column it reaches, exact once that column's
+completions have all closed (a lag of a couple knight\--moves). The SpMV cannot
+reconstruct completions that close inside the recorded/seed columns, so its
+{\it first\/} extrapolated column, |recend+1|, comes out short. We therefore
+trust the direct count one column past the recorded region --- the |seam_break|
+sweep ran far enough for its completions to close --- and hand over to the SpMV
+only from |recend+2|, exactly where the cross\--check begins. If a period was
+recorded we also assert the transfer is stationary; a mismatch means the strip
+was too narrow and the recording is boundary\--contaminated.
+
+@<Finalize direct coverage and verify periodicity@>=
+{ int swept = (s>=V)? n : s/m;
+  if(c0<0){ direct_valid_col_g = swept>0? swept-1 : 0;   /* no period: direct only */
+    fprintf(stderr,"no confirmed period within strip W_b=%d: direct counts only "
+      "(increase W_b to record the periodic transfer)\n",n); }
+  else { direct_valid_col_g = (swept>=recend_col_g+3)? recend_col_g+1 : recend_col_g;
+    if(nstate[0]!=nstate[Plevs]){
+      fprintf(stderr,"ERROR: recorded transfer not stationary (nstate[0]=%ld "
+        "nstate[Plevs]=%ld); strip W_b=%d too narrow -- recording columns are "
+        "boundary-contaminated. Rebuild with a larger W_b.\n",
+        nstate[0],nstate[Plevs],n); exit(4); } }
+}
+
+@ @<Subroutines@>=
 /* SpMV from the (built or loaded) tables out to column |Nto|. |crosscheck|
    compares against the direct |cnt| where both are valid. Uses |cnt2| scratch. */
 int build_extract(int mm,int Wb){ return run_periodic(mm,Wb,Wb); }
@@ -371,12 +455,12 @@ void spmv_run(int Nto,int crosscheck){
   { int good=1,cc;
     if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=direct_cov_g;cc++) if(cnt[cc*m]!=cnt2[cc*m]){ good=0;
       fprintf(stderr,"MISMATCH c=%d direct=%llu spmv=%llu\n",cc,cnt[cc*m],cnt2[cc*m]); }
-    for(cc=1;cc<=Nto;cc++){ u64 val = cc<=recend_col_g? red(cnt[cc*m]) : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>recend_col_g?"  (SpMV)":""); }
+    for(cc=1;cc<=Nto;cc++){ u64 val = cc<=direct_valid_col_g? red(cnt[cc*m]) : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>direct_valid_col_g?"  (SpMV)":""); }
     if(crosscheck) fprintf(stderr,"%s\n", good?"SpMV matches direct":"SpMV MISMATCH"); }
 }
 
 @ @<Iterate the SpMV out to column $N$@>=
-{ u64* v=xmalloc(nstate[0]*sizeof(u64)); memcpy(v,seedv,nstate[0]*sizeof(u64));
+if(c0_g>=0 && Plevs>0){ u64* v=xmalloc(nstate[0]*sizeof(u64)); memcpy(v,seedv,nstate[0]*sizeof(u64));
   int basecol=c0_g+1;
   while(basecol<=Nto){ int L;
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
@@ -408,10 +492,7 @@ No arguments: self\--checks (direct sweep vs known values, and SpMV vs direct).
 void spmv_run(int Nto,int crosscheck);
 int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
-  { long ram=sysconf(_SC_PHYS_PAGES)*(long)sysconf(_SC_PAGE_SIZE); long cap=(long)(ram*0.85);
-    char*e=getenv("MEMCAP_GB"); if(e) cap=atol(e)*(1L<<30);
-    struct rlimit rl={cap,cap}; setrlimit(RLIMIT_AS,&rl);
-    fprintf(stderr,"self memory cap: %.0f GB (set MEMCAP_GB to override)\n",cap/1073741824.0); }
+  start_mem_watcher();
   if(argc>=5 && !strcmp(argv[1],"build")){ /* build m Wb file [ckpt] : build+extract, dump tables */
     stop_after_record=1; if(argc>=6) ckpt_path=argv[5]; if(argc>=7) ckpt_every=atoi(argv[6]);
     build_extract(atoi(argv[2]),atoi(argv[3])); dump_tables(argv[4]); return 0; }
