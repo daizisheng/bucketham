@@ -504,13 +504,22 @@ int main(int argc,char*argv[]){
     if(argc>=5) MODP=strtoull(argv[4],0,10);
     spmv_run(atoi(argv[3]),0); return 0; }
   if(argc==4){ run_periodic(atoi(argv[1]),atoi(argv[2]),atoi(argv[3])); return 0; }
-  struct{int m,Wb,c;u64 e;} chk[]={{5,12,4,82},{5,12,6,18784},{5,12,8,18061054ULL},
-    {5,12,9,264895640ULL},{5,12,10,7886117822ULL},{7,6,4,6378},{6,7,6,3318960},{0,0,0,0}};
-  int i,bad=0,lm=0,lw=0;
+  /* A light smoke test: m=4 is tiny, and by transposition it also pins the m=6
+     and m=7 values (4xc=cx4) without their million-state sweeps; one m=5 strip,
+     built wide enough to record, exercises both the direct and the SpMV paths. */
+  struct{int m,Wb,Next,c;u64 e;} chk[]={
+    {4,9,9,6,744ULL},                       /* 4x6 = 6x4 */
+    {4,9,9,7,6378ULL},                      /* 4x7 = 7x4 */
+    {5,18,22,8,18061054ULL},                /* m=5, direct column */
+    {5,18,22,12,3611823644006ULL},          /* m=5, direct seam column (recend+1) */
+    {5,18,22,15,24535910156176100ULL},      /* m=5, SpMV extrapolation (past recend+1) */
+    {0,0,0,0,0}};
+  int i,bad=0,lm=0,lw=0,ln=0;
   for(i=0;chk[i].m;i++){
-    if(chk[i].m!=lm||chk[i].Wb!=lw){ run_periodic(chk[i].m,chk[i].Wb,chk[i].Wb); lm=chk[i].m; lw=chk[i].Wb; }
-    u64 g=cnt[chk[i].c*chk[i].m], e=red(chk[i].e);
-    printf("open %dx%d = %llu  exp(mod p) %llu  %s\n",chk[i].m,chk[i].c,g,e,g==e?"OK":"FAIL");
+    if(chk[i].m!=lm||chk[i].Wb!=lw||chk[i].Next!=ln){
+      run_periodic(chk[i].m,chk[i].Wb,chk[i].Next); lm=chk[i].m; lw=chk[i].Wb; ln=chk[i].Next; }
+    int c=chk[i].c; u64 g=(c<=direct_valid_col_g? cnt[c*m] : cnt2[c*m]), e=red(chk[i].e);
+    printf("open %dx%d = %llu  exp %llu  %s\n",chk[i].m,c,g,e,g==e?"OK":"FAIL");
     if(g!=e) bad++; }
   printf("%s\n",bad?"SOME FAILED":"ALL OK"); return bad?1:0;
 }
