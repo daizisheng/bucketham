@@ -263,9 +263,16 @@ void sort_reduce(int s,int rec){
     for(r=0;r<P;r++){ long j; for(j=0;j<rne[r];j++){ eb[enb]=re[r][j]; eb[enb].dst += base[r]; enb++; } }
     qsort(eb,enb,sizeof(Edge),ecmp);
     for(pp=0;pp<enb;){ long q2=pp+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[pp].src&&eb[q2].dst==eb[pp].dst){cc++;q2++;} eb[o]=eb[pp]; eb[o].c=cc; o++; pp=q2; }
-    edges[reclev]=xrealloc(eb,(o+1)*sizeof(Edge)); nedge[reclev]=o;
-    nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur;
-    comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp)); ncomp[reclev]=reccomp_n;
+    nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur; nedge[reclev]=o; ncomp[reclev]=reccomp_n;
+    if(stream_edges){  /* write this level to disk in the on-disk level format, free RAM */
+      if(!rec_fp){ rec_fp=fopen(rec_path,"wb"); if(!rec_fp){ fprintf(stderr,"cannot open %s\n",rec_path); exit(3); } }
+      fwrite(&o,sizeof(long),1,rec_fp); fwrite(eb,sizeof(Edge),o,rec_fp);
+      fwrite(&reccomp_n,sizeof(long),1,rec_fp); fwrite(reccomp_buf,sizeof(Comp),reccomp_n,rec_fp);
+      free(eb); edges[reclev]=0; comps[reclev]=0;
+    } else {
+      edges[reclev]=xrealloc(eb,(o+1)*sizeof(Edge));
+      comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
+    }
     reclev++; }
 }
 
@@ -294,6 +301,7 @@ long nstate[MAXLEV+1]; int Plevs;
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int direct_valid_col_g;             /* direct |cnt| is exact for columns $\le$ this */
 int stop_after_record=0; int direct_cov_g=0;
+int stream_edges=0; FILE* rec_fp=0; char rec_path[4096];  /* out-of-core recording */
 static u64 colfp_g[4096]; const char* ckpt_path=0; int ckpt_every=4;   /* checkpoint every K columns */
 u64* seedv; long seedn;
 Comp* reccomp_buf; long reccomp_n, reccomp_cap;
@@ -395,7 +403,10 @@ void dump_tables(const char*path){ FILE*f=fopen(path,"wb"); int L;
   int hdr[6]={m,period_g,c0_g,Plevs,recend_col_g,direct_valid_col_g}; fwrite(hdr,sizeof(int),6,f);
   fwrite(&seedn,sizeof(long),1,f); fwrite(seedv,sizeof(u64),seedn,f);
   fwrite(nstate,sizeof(long),Plevs+1,f);
-  for(L=0;L<Plevs;L++){ fwrite(&nedge[L],sizeof(long),1,f); fwrite(edges[L],sizeof(Edge),nedge[L],f);
+  if(stream_edges && rec_fp){  /* levels already on disk (rec_path) in the same format; copy them in */
+    fclose(rec_fp); rec_fp=0; FILE*g=fopen(rec_path,"rb");
+    if(g){ char*buf=xmalloc(1<<20); size_t k; while((k=fread(buf,1,1<<20,g))>0) fwrite(buf,1,k,f); free(buf); fclose(g); remove(rec_path); } }
+  else for(L=0;L<Plevs;L++){ fwrite(&nedge[L],sizeof(long),1,f); fwrite(edges[L],sizeof(Edge),nedge[L],f);
     fwrite(&ncomp[L],sizeof(long),1,f); fwrite(comps[L],sizeof(Comp),ncomp[L],f); }
   int nc=(direct_valid_col_g+1)*m; fwrite(&nc,sizeof(int),1,f); fwrite(cnt,sizeof(u64),nc,f);
   fclose(f); fprintf(stderr,"dumped tables to %s (period %d, c0 %d, %d levels)\n",path,period_g,c0_g,Plevs); }
@@ -443,7 +454,7 @@ int run_periodic(int mm,int Wb,int Next){
   }
   @<Finalize direct coverage and verify periodicity@>@;
   direct_cov_g = stop_after_record ? direct_valid_col_g : n;
-  spmv_run(Next, 1);
+  if(!stream_edges) spmv_run(Next, 1);   /* streamed edges are freed; SpMV via a separate `run` */
   return c0;
 }
 
@@ -546,10 +557,12 @@ int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
   start_mem_watcher();
   if(argc>=5 && !strcmp(argv[1],"build")){ /* build m Wb file [ckpt] : build+extract, dump tables */
-    stop_after_record=1; if(argc>=6) ckpt_path=argv[5]; if(argc>=7) ckpt_every=atoi(argv[6]);
+    stop_after_record=1; stream_edges=1; snprintf(rec_path,sizeof rec_path,"%s.lvl",argv[4]);
+    if(argc>=6) ckpt_path=argv[5]; if(argc>=7) ckpt_every=atoi(argv[6]);
     build_extract(atoi(argv[2]),atoi(argv[3])); dump_tables(argv[4]); return 0; }
   if(argc==5 && !strcmp(argv[1],"resume")){ /* resume ckpt Wb file : continue a build */
-    stop_after_record=1; resume_from=load_ckpt(argv[2]); ckpt_path=argv[2];
+    stop_after_record=1; stream_edges=1; snprintf(rec_path,sizeof rec_path,"%s.lvl",argv[4]);
+    resume_from=load_ckpt(argv[2]); ckpt_path=argv[2];
     build_extract(m,atoi(argv[3])); dump_tables(argv[4]); return 0; }
   if(argc>=4 && !strcmp(argv[1],"run")){ /* run file Nto [prime] : load tables, SpMV (mod prime if given) */
     if(!load_tables(argv[2])){ fprintf(stderr,"cannot load %s\n",argv[2]); return 1; }
