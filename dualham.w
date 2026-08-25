@@ -172,50 +172,77 @@ int rcmp_r(const void*A,const void*B,void*arg){ unsigned char*base=arg; const Re
    pass (keeping global sort order so periodic ids stay consistent), capturing
    the integer edge table when recording. */
 long in_ncur_g;
-/* Merge the per-thread sorted lists with an NT-way heap directly into the
-   reduced output -- memory-efficient (no full sorted copy is materialized), so
-   it stays within RAM for large m. It is partly serial (the heap pops); a
-   splitter-based PARALLEL merge (partition the output by sampled splitters, then
-   merge each part independently) is the next optimization for m>=7 speed, but
-   the bucket-copy variant it replaces used ~2x the memory and could OOM. */
+/* Parallel splitter merge: sort each thread's records, sample P-1 splitter keys
+   that cut the key space into P balanced ranges, binary-search each thread for
+   the range boundaries, then merge+reduce each range INDEPENDENTLY in parallel,
+   writing to a per-range output buffer. Equal keys never span a range (splitter
+   lower_bound is consistent across threads), so the ranges just concatenate.
+   Parallel AND memory-safe: no full sorted copy of the records is materialized. */
+#define NRNG 256
+int keycmp(unsigned char*a,int la,unsigned char*b,int lb){ int l=la<lb?la:lb; int d=memcmp(a,b,l); return d?d:la-lb; }
+typedef struct{ unsigned char* k; int len; } Samp;
+int sampcmp(const void*A,const void*B){ const Samp*a=A,*b=B; return keycmp(a->k,a->len,b->k,b->len); }
+static unsigned char* rk[NRNG]; static long rkcap[NRNG], rkuse[NRNG];
+static int* rkl[NRNG]; static u64* rw_[NRNG]; static long rcnt[NRNG], rgcap[NRNG];
+static Edge* re[NRNG]; static long rne[NRNG], recap[NRNG];
+static long bnd[NTMAX][NRNG+1];
 void sort_reduce(int s,int rec){
-  int NT=omp_get_max_threads(), t; long tot=0;
+  int NT=omp_get_max_threads(), t, r; long i;
 #pragma omp parallel for schedule(dynamic,1)
   for(t=0;t<NT;t++) if(tnr[t]) qsort_r(trc[t],tnr[t],sizeof(Rec),rcmp_r,tkp[t]);
-  for(t=0;t<NT;t++) tot+=tnr[t];
-  long tbytes=0; for(t=0;t<NT;t++) tbytes+=tkuse[t];
-  curoff=xrealloc(curoff,(tot+1)*sizeof(long)); curkl=xrealloc(curkl,(tot+1)*sizeof(int));
-  curw=xrealloc(curw,(tot+1)*sizeof(u64)); curkp=xrealloc(curkp,tbytes+1);
-  static long idx[NTMAX]; for(t=0;t<NT;t++) idx[t]=0;
-  Edge* eb=0; long enb=0; if(rec) eb=xmalloc((tot+1)*sizeof(Edge));
-  long k=0,use=0;
-  static int heap[NTMAX]; int hn=0;
-#define HKEY(t) (tkp[t]+trc[t][idx[t]].off)
-#define HLEN(t) (trc[t][idx[t]].len)
-#define HLESS(a,b) ({ int la_=HLEN(a),lb_=HLEN(b),l_=la_<lb_?la_:lb_; int d_=memcmp(HKEY(a),HKEY(b),l_); d_<0||(d_==0&&la_<lb_); })
-  for(t=0;t<NT;t++) if(idx[t]<tnr[t]){ int c=hn++; heap[c]=t;
-    while(c>0){ int pp=(c-1)/2; if(HLESS(heap[c],heap[pp])){ int x=heap[c];heap[c]=heap[pp];heap[pp]=x; c=pp; } else break; } }
-  int curlen=-1; long curpos=0; u64 sw=0;
-  while(hn>0){ int mt=heap[0]; Rec*R=&trc[mt][idx[mt]]; unsigned char*rkey=tkp[mt]+R->off; int rlen=R->len;
-    int same=(curlen==rlen && memcmp(curkp+curpos,rkey,rlen)==0);
-    if(!same){ if(curlen>=0){ curw[k]=sw; k++; }
-      curpos=use; memcpy(curkp+use,rkey,rlen); curoff[k]=use; curkl[k]=rlen; use+=rlen; curlen=rlen; sw=0; }
-    sw=red(sw+R->w);
-    if(rec){ eb[enb].src=(int)R->src; eb[enb].dst=(int)k; eb[enb].c=1; enb++; }
-    idx[mt]++;
-    if(idx[mt]>=tnr[mt]) heap[0]=heap[--hn];
-    { int c=0; while(1){ int l=2*c+1,r=2*c+2,sm=c;
-      if(l<hn && HLESS(heap[l],heap[sm])) sm=l; if(r<hn && HLESS(heap[r],heap[sm])) sm=r;
-      if(sm==c) break; int x=heap[c];heap[c]=heap[sm];heap[sm]=x; c=sm; } } }
-  if(curlen>=0){ curw[k]=sw; k++; }
-  ncur=k;
+  long tot=0; for(t=0;t<NT;t++) tot+=tnr[t];
+  int P=NT*8; if(P>NRNG) P=NRNG; if(P<1) P=1; if((long)P>tot && tot>0) P=(int)tot;
+  int S=P*8; if((long)S>tot) S=(int)tot;
+  static Samp* samp=0; static long sampcap=0; if(sampcap<S+1){ sampcap=S+1; samp=xrealloc(samp,sampcap*sizeof(Samp)); }
+  long sc=0;
+  for(t=0;t<NT && tot>0;t++){ long nt=tnr[t]; if(nt==0) continue; long take=(long)((double)S*nt/tot); if(take<1) take=1; long j;
+    for(j=0;j<take && sc<S;j++){ long idx=(long)((double)j*nt/take); if(idx>=nt) idx=nt-1; Rec*R=&trc[t][idx]; samp[sc].k=tkp[t]+R->off; samp[sc].len=R->len; sc++; } }
+  S=(int)sc; qsort(samp,S,sizeof(Samp),sampcmp);
+  static Samp spl[NRNG]; int np=0, p;
+  for(p=1;p<P;p++){ long si=(long)((double)p*S/P); if(si>=S) si=S-1; if(S>0) spl[np++]=samp[si]; }
+  for(t=0;t<NT;t++){ bnd[t][0]=0; bnd[t][P]=tnr[t];
+    for(p=0;p<np;p++){ long lo=0,hi=tnr[t]; while(lo<hi){ long mid=(lo+hi)/2; Rec*R=&trc[t][mid];
+      if(keycmp(tkp[t]+R->off,R->len,spl[p].k,spl[p].len)<0) lo=mid+1; else hi=mid; } bnd[t][p+1]=lo; } }
+#pragma omp parallel for schedule(dynamic,1)
+  for(r=0;r<P;r++){
+    int hp[NTMAX]; long hpos[NTMAX]; int hn=0, tt;
+    for(tt=0;tt<NT;tt++) hpos[tt]=bnd[tt][r];
+#define RLESS(a,b) ({ Rec*Ra=&trc[a][hpos[a]],*Rb=&trc[b][hpos[b]]; keycmp(tkp[a]+Ra->off,Ra->len,tkp[b]+Rb->off,Rb->len)<0; })
+    for(tt=0;tt<NT;tt++) if(hpos[tt]<bnd[tt][r+1]){ int c=hn++; hp[c]=tt;
+      while(c>0){ int pp=(c-1)/2; if(RLESS(hp[c],hp[pp])){ int x=hp[c];hp[c]=hp[pp];hp[pp]=x; c=pp; } else break; } }
+    rkuse[r]=0; rcnt[r]=0; rne[r]=0; int curlen=-1; long curpos=0; u64 sw=0;
+    while(hn>0){ int mt=hp[0]; Rec*R=&trc[mt][hpos[mt]]; unsigned char*rkey=tkp[mt]+R->off; int rlen=R->len;
+      int same=(curlen==rlen && memcmp(rk[r]+curpos,rkey,rlen)==0);
+      if(!same){ if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); rw_[r]=xrealloc(rw_[r],rgcap[r]*sizeof(u64)); } rkl[r][rcnt[r]]=curlen; rw_[r][rcnt[r]]=sw; rcnt[r]++; }
+        if(rkuse[r]+rlen>rkcap[r]){ rkcap[r]=rkcap[r]*2+rlen+4096; rk[r]=xrealloc(rk[r],rkcap[r]); }
+        curpos=rkuse[r]; memcpy(rk[r]+rkuse[r],rkey,rlen); rkuse[r]+=rlen; curlen=rlen; sw=0; }
+      sw=red(sw+R->w);
+      if(rec){ if(rne[r]>=recap[r]){ recap[r]=recap[r]*2+1024; re[r]=xrealloc(re[r],recap[r]*sizeof(Edge)); } re[r][rne[r]].src=(int)R->src; re[r][rne[r]].dst=(int)rcnt[r]; re[r][rne[r]].c=1; rne[r]++; }
+      hpos[mt]++;
+      if(hpos[mt]>=bnd[mt][r+1]) hp[0]=hp[--hn];
+      { int c=0; while(1){ int l=2*c+1,r2=2*c+2,sm=c; if(l<hn&&RLESS(hp[l],hp[sm]))sm=l; if(r2<hn&&RLESS(hp[r2],hp[sm]))sm=r2; if(sm==c)break; int x=hp[c];hp[c]=hp[sm];hp[sm]=x; c=sm; } }
+    }
+    if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); rw_[r]=xrealloc(rw_[r],rgcap[r]*sizeof(u64)); } rkl[r][rcnt[r]]=curlen; rw_[r][rcnt[r]]=sw; rcnt[r]++; }
+  }
+  static long base[NRNG+1], kbase[NRNG+1], ebase[NRNG+1];
+  base[0]=kbase[0]=ebase[0]=0;
+  for(r=0;r<P;r++){ base[r+1]=base[r]+rcnt[r]; kbase[r+1]=kbase[r]+rkuse[r]; ebase[r+1]=ebase[r]+rne[r]; }
+  ncur=base[P];
+  curoff=xrealloc(curoff,(ncur+1)*sizeof(long)); curkl=xrealloc(curkl,(ncur+1)*sizeof(int));
+  curw=xrealloc(curw,(ncur+1)*sizeof(u64)); curkp=xrealloc(curkp,kbase[P]+1);
+#pragma omp parallel for schedule(dynamic,1)
+  for(r=0;r<P;r++){ long off=kbase[r], j; memcpy(curkp+kbase[r], rk[r], rkuse[r]);
+    for(j=0;j<rcnt[r];j++){ curkl[base[r]+j]=rkl[r][j]; curw[base[r]+j]=rw_[r][j]; curoff[base[r]+j]=off; off+=rkl[r][j]; } }
   for(t=0;t<NT;t++){ tnr[t]=0; tkuse[t]=0; }
-  if(rec){ long o=0,p; qsort(eb,enb,sizeof(Edge),ecmp);
-    for(p=0;p<enb;){ long q2=p+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[p].src&&eb[q2].dst==eb[p].dst){cc++;q2++;} eb[o]=eb[p]; eb[o].c=cc; o++; p=q2; }
+  if(rec){ Edge* eb=xmalloc((ebase[P]+1)*sizeof(Edge)); long enb=0; long o=0,pp;
+    for(r=0;r<P;r++){ long j; for(j=0;j<rne[r];j++){ eb[enb]=re[r][j]; eb[enb].dst += base[r]; enb++; } }
+    qsort(eb,enb,sizeof(Edge),ecmp);
+    for(pp=0;pp<enb;){ long q2=pp+1; u64 cc=1; while(q2<enb&&eb[q2].src==eb[pp].src&&eb[q2].dst==eb[pp].dst){cc++;q2++;} eb[o]=eb[pp]; eb[o].c=cc; o++; pp=q2; }
     edges[reclev]=xrealloc(eb,(o+1)*sizeof(Edge)); nedge[reclev]=o;
     nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur;
     comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp)); ncomp[reclev]=reccomp_n;
-    reclev++; } }
+    reclev++; }
+}
 
 @* The transfer step.
 The bucket holds states as (key,weight) over the previous frontier. To place
