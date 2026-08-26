@@ -12,7 +12,7 @@ bucketham: bucketham.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 dualham: dualham.c
-	$(CC) $(CFLAGS) -fopenmp -o $@ $<
+	$(CC) -O3 -march=native $(CFLAGS) -fopenmp -o $@ $<
 
 dualham.c: dualham.w
 	ctangle dualham.w

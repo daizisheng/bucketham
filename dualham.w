@@ -660,6 +660,7 @@ long* csoff[MAXLEV]; long* csdst[MAXLEV]; int csn[MAXLEV];
 @ @<Subroutines@>=
 static int vput(unsigned char*p,u64 x){ int n=0; while(x>=0x80){ p[n++]=(x&0x7f)|0x80; x>>=7; } p[n++]=(unsigned char)x; return n; }
 static u64 vget(unsigned char**pp){ unsigned char*p=*pp; u64 x=0; int sh=0; unsigned char b; do{ b=*p++; x|=(u64)(b&0x7f)<<sh; sh+=7; }while(b&0x80); *pp=p; return x; }
+static inline u32 barr(u64 x,u64 p,u64 mu){ u64 q=(u64)(((u128)x*mu)>>64); u64 r=x-q*p; if(r>=p)r-=p; if(r>=p)r-=p; return (u32)r; }
 void compress_table(const char*in,const char*out){
   FILE*f=fopen(in,"rb"); if(!f){ fprintf(stderr,"cannot open %s\n",in); exit(1); }
   int hdr[6]; if(fread(hdr,sizeof(int),6,f)!=6){fprintf(stderr,"bad table\n");exit(1);}
@@ -713,6 +714,7 @@ void spmv_run_batch_c(int Nto,u64* pr,int B){
   u32* cnt2b=xcalloc((size_t)(1<<16)*B,sizeof(u32));
   u32* v=xmalloc((size_t)nstate[0]*B*sizeof(u32));
   for(i=0;i<nstate[0];i++){ u128 sd=seedv[i]; for(b=0;b<B;b++) v[i*B+b]=(u32)(sd%pr[b]); }
+  static u64 mu[64]; for(b=0;b<B;b++) mu[b]=(u64)((((u128)1)<<64)/pr[b]);
   int basecol=c0_g+1;
   while(basecol<=Nto){ int L;
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
@@ -724,12 +726,17 @@ void spmv_run_batch_c(int Nto,u64* pr,int B){
       for(tt=0;tt<NT;tt++){ int s0=(int)((long)tt*SN/NT), s1=(int)((long)(tt+1)*SN/NT); if(s1>SN)s1=SN;
         if(s0<s1){ unsigned char* p=cedge[L]+csoff[L][s0];
           unsigned char* endp=cedge[L]+(s1<SN? csoff[L][s1] : ced_len[L]);
-          long prev_dst=csdst[L][s0]; u64 acc[64]; int bb;
-          while(p<endp){ long dst=prev_dst+(long)vget(&p); long gsize=(long)vget(&p);
-            for(bb=0;bb<B;bb++) acc[bb]=0; long prev_src=0,gg;
-            for(gg=0;gg<gsize;gg++){ long src=prev_src+(long)vget(&p); prev_src=src; u64 c=vget(&p);
-              for(bb=0;bb<B;bb++) acc[bb]+=(u64)v[(size_t)src*B+bb]*c; }
-            for(bb=0;bb<B;bb++) vn[(size_t)dst*B+bb]=(u32)(acc[bb]%pr[bb]); prev_dst=dst; } } }
+          long prev_dst=csdst[L][s0], cur=-1; u64 acc[64]; int bb,w;
+          long Wdst[640],Wsrc[640]; u32 Wc[640];
+          while(p<endp){ int nw=0;               /* decode a window of whole groups */
+            while(p<endp && nw<512){ long dst=prev_dst+(long)vget(&p); long gsize=(long)vget(&p); long ps=0,gg;
+              for(gg=0;gg<gsize;gg++){ long src=ps+(long)vget(&p); ps=src; Wdst[nw]=dst; Wsrc[nw]=src; Wc[nw]=(u32)vget(&p); nw++; }
+              prev_dst=dst; }
+            for(w=0;w<nw;w++) __builtin_prefetch(&v[(size_t)Wsrc[w]*B],0,1);  /* hide gather latency */
+            for(w=0;w<nw;w++){ if(Wdst[w]!=cur){ if(cur>=0) for(bb=0;bb<B;bb++) vn[(size_t)cur*B+bb]=barr(acc[bb],pr[bb],mu[bb]);
+                cur=Wdst[w]; for(bb=0;bb<B;bb++) acc[bb]=0; }
+              for(bb=0;bb<B;bb++) acc[bb]+=(u64)v[(size_t)Wsrc[w]*B+bb]*Wc[w]; } }
+          if(cur>=0) for(bb=0;bb<B;bb++) vn[(size_t)cur*B+bb]=(u32)(acc[bb]%pr[bb]); } }
       free(v); v=vn; }
     basecol+=period_g; }
   free(v);
