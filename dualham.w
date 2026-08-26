@@ -45,6 +45,7 @@ with an already\--placed neighbour.
 @<Types@>=
 typedef unsigned long long u64;
 typedef unsigned __int128 u128;   /* exact build weights (u64 seeds overflow at m>=7) */
+typedef unsigned int u32;
 
 @ @d MAXF 512
 @d MAXLEV 40
@@ -595,12 +596,56 @@ if(c0_g>=0 && Plevs>0){ u64* v=xmalloc(nstate[0]*sizeof(u64)); { long i2; for(i2
   for(cc=1;cc<=Next;cc++){ u64 val = cc<=Wb? cnt[cc*m] : cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>Wb?"  (SpMV)":""); }
   fprintf(stderr,"%s\n", good?"SpMV matches direct":"SpMV MISMATCH"); }
 
+@ Block SpMV: compute several primes' residues in ONE pass over the edge table.
+The per\--prime state vectors are interleaved (|v[i*B+b]|), so a cache line serves
+several primes at once; the edges (sorted by |dst|) are summed per\--|dst| in a u64
+scratch and reduced once, not once per edge. This amortizes the dominant edge
+bandwidth across the whole prime batch -- the big win when the table is RAM\--resident.
+
+@<Subroutines@>=
+void spmv_run_batch(int Nto,u64* pr,int B){
+  int cc,b; long i;
+  if(c0_g<0 || Plevs<=0){
+    for(cc=1;cc<=Nto;cc++) if(cc<=direct_valid_col_g){ printf("%d",cc);
+      for(b=0;b<B;b++) printf(" %llu",(unsigned long long)(u64)(cnt[cc*m]%pr[b])); printf("\n"); }
+    return; }
+  u32* cnt2b=xcalloc((size_t)(1<<16)*B,sizeof(u32));
+  u32* v=xmalloc((size_t)nstate[0]*B*sizeof(u32));
+  for(i=0;i<nstate[0];i++){ u128 sd=seedv[i]; for(b=0;b<B;b++) v[i*B+b]=(u32)(sd%pr[b]); }
+  int basecol=c0_g+1;
+  static Edge* buf=0; static long bufcap=0; long CH=1L<<20;
+  if(bufcap<CH){ bufcap=CH; buf=xrealloc(buf,bufcap*sizeof(Edge)); }
+  while(basecol<=Nto){ int L;
+    for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
+      for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; long sc=comps[L][e].src; u64 mult=comps[L][e].mult;
+        if(idx>=0 && idx<(1<<16)) for(b=0;b<B;b++){ size_t o=(size_t)idx*B+b;
+          cnt2b[o]=(u32)(((u64)cnt2b[o]+(u64)v[(size_t)sc*B+b]*mult)%pr[b]); } }
+      u32* vn=xcalloc((size_t)nstate[L+1]*B,sizeof(u32));
+      fseeko(tbl_fp,lev_edge_off[L],SEEK_SET);
+      long ne=nedge[L], done=0, cur_dst=-1; static u64 acc[64];
+      while(done<ne){ long chunk=ne-done; if(chunk>CH) chunk=CH;
+        if((long)fread(buf,sizeof(Edge),chunk,tbl_fp)!=chunk){ fprintf(stderr,"table read error\n"); exit(3); }
+        long e2; for(e2=0;e2<chunk;e2++){ long dst=buf[e2].dst, src=buf[e2].src; u64 c=buf[e2].c;
+          if(dst!=cur_dst){ if(cur_dst>=0) for(b=0;b<B;b++) vn[(size_t)cur_dst*B+b]=(u32)(acc[b]%pr[b]);
+            cur_dst=dst; for(b=0;b<B;b++) acc[b]=0; }
+          for(b=0;b<B;b++) acc[b]+=(u64)v[(size_t)src*B+b]*c; }
+        done+=chunk; }
+      if(cur_dst>=0) for(b=0;b<B;b++) vn[(size_t)cur_dst*B+b]=(u32)(acc[b]%pr[b]);
+      free(v); v=vn; }
+    basecol+=period_g; }
+  free(v);
+  for(cc=1;cc<=Nto;cc++){ printf("%d",cc);
+    for(b=0;b<B;b++){ u64 r = cc<=direct_valid_col_g ? (u64)(cnt[cc*m]%pr[b]) : (u64)cnt2b[(size_t)(cc*m)*B+b];
+      printf(" %llu",(unsigned long long)r); } printf("\n"); }
+  free(cnt2b); }
+
 @* Main.
 No arguments: self\--checks (direct sweep vs known values, and SpMV vs direct).
 |dualham m Wb N|: build to column $W_b$, then extend to column~$N$ by SpMV.
 
 @<Main@>=
 void spmv_run(int Nto,int crosscheck);
+void spmv_run_batch(int Nto,u64* pr,int B);
 int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
   start_mem_watcher();
@@ -616,6 +661,10 @@ int main(int argc,char*argv[]){
     if(!load_tables(argv[2])){ fprintf(stderr,"cannot load %s\n",argv[2]); return 1; }
     if(argc>=5) MODP=strtoull(argv[4],0,10);
     spmv_run(atoi(argv[3]),0); return 0; }
+  if(argc>=5 && !strcmp(argv[1],"runb")){ /* runb file Nto p1 p2 ... : one table pass, many primes */
+    if(!load_tables(argv[2])){ fprintf(stderr,"cannot load %s\n",argv[2]); return 1; }
+    int B=argc-4; if(B>64) B=64; static u64 pr[64]; int b; for(b=0;b<B;b++) pr[b]=strtoull(argv[4+b],0,10);
+    spmv_run_batch(atoi(argv[3]),pr,B); return 0; }
   if(argc==4){ run_periodic(atoi(argv[1]),atoi(argv[2]),atoi(argv[3])); return 0; }
   /* A light smoke test: m=4 is tiny, and by transposition it also pins the m=6
      and m=7 values (4xc=cx4) without their million-state sweeps; one m=5 strip,
