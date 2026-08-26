@@ -613,30 +613,128 @@ void spmv_run_batch(int Nto,u64* pr,int B){
   u32* v=xmalloc((size_t)nstate[0]*B*sizeof(u32));
   for(i=0;i<nstate[0];i++){ u128 sd=seedv[i]; for(b=0;b<B;b++) v[i*B+b]=(u32)(sd%pr[b]); }
   int basecol=c0_g+1;
-  static Edge* buf=0; static long bufcap=0; long CH=1L<<20;
-  if(bufcap<CH){ bufcap=CH; buf=xrealloc(buf,bufcap*sizeof(Edge)); }
+  static Edge* lbuf=0; static long lbufcap=0;
   while(basecol<=Nto){ int L;
     for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
       for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; long sc=comps[L][e].src; u64 mult=comps[L][e].mult;
         if(idx>=0 && idx<(1<<16)) for(b=0;b<B;b++){ size_t o=(size_t)idx*B+b;
           cnt2b[o]=(u32)(((u64)cnt2b[o]+(u64)v[(size_t)sc*B+b]*mult)%pr[b]); } }
       u32* vn=xcalloc((size_t)nstate[L+1]*B,sizeof(u32));
+      long ne=nedge[L];
+      /* read the level's edges (served from page cache if resident), then apply
+         in parallel: split at |dst| boundaries so threads write disjoint |vn| */
+      if(lbufcap<ne){ lbufcap=ne; lbuf=xrealloc(lbuf,lbufcap*sizeof(Edge)); }
       fseeko(tbl_fp,lev_edge_off[L],SEEK_SET);
-      long ne=nedge[L], done=0, cur_dst=-1; static u64 acc[64];
-      while(done<ne){ long chunk=ne-done; if(chunk>CH) chunk=CH;
-        if((long)fread(buf,sizeof(Edge),chunk,tbl_fp)!=chunk){ fprintf(stderr,"table read error\n"); exit(3); }
-        long e2; for(e2=0;e2<chunk;e2++){ long dst=buf[e2].dst, src=buf[e2].src; u64 c=buf[e2].c;
-          if(dst!=cur_dst){ if(cur_dst>=0) for(b=0;b<B;b++) vn[(size_t)cur_dst*B+b]=(u32)(acc[b]%pr[b]);
-            cur_dst=dst; for(b=0;b<B;b++) acc[b]=0; }
-          for(b=0;b<B;b++) acc[b]+=(u64)v[(size_t)src*B+b]*c; }
-        done+=chunk; }
-      if(cur_dst>=0) for(b=0;b<B;b++) vn[(size_t)cur_dst*B+b]=(u32)(acc[b]%pr[b]);
+      { long rd=0; while(rd<ne){ long ch=ne-rd; if(ch>(1L<<24)) ch=1L<<24;
+          if((long)fread(lbuf+rd,sizeof(Edge),ch,tbl_fp)!=ch){ fprintf(stderr,"table read error\n"); exit(3); } rd+=ch; } }
+      { int NT=omp_get_max_threads(),tt; static long pbnd[NTMAX+1]; pbnd[0]=0; pbnd[NT]=ne;
+        for(tt=1;tt<NT;tt++){ long g=(long)((double)tt*ne/NT);
+          while(g>0&&g<ne&&lbuf[g].dst==lbuf[g-1].dst) g++; pbnd[tt]=g; }
+#pragma omp parallel for schedule(dynamic,1)
+        for(tt=0;tt<NT;tt++){ long e2,cur=-1; u64 acc[64]; int bb;
+          for(e2=pbnd[tt];e2<pbnd[tt+1];e2++){ long dst=lbuf[e2].dst, src=lbuf[e2].src; u64 c=lbuf[e2].c;
+            if(dst!=cur){ if(cur>=0) for(bb=0;bb<B;bb++) vn[(size_t)cur*B+bb]=(u32)(acc[bb]%pr[bb]);
+              cur=dst; for(bb=0;bb<B;bb++) acc[bb]=0; }
+            for(bb=0;bb<B;bb++) acc[bb]+=(u64)v[(size_t)src*B+bb]*c; }
+          if(cur>=0) for(bb=0;bb<B;bb++) vn[(size_t)cur*B+bb]=(u32)(acc[bb]%pr[bb]); } }
       free(v); v=vn; }
     basecol+=period_g; }
   free(v);
   for(cc=1;cc<=Nto;cc++){ printf("%d",cc);
     for(b=0;b<B;b++){ u64 r = cc<=direct_valid_col_g ? (u64)(cnt[cc*m]%pr[b]) : (u64)cnt2b[(size_t)(cc*m)*B+b];
       printf(" %llu",(unsigned long long)r); } printf("\n"); }
+  free(cnt2b); }
+
+@ Compressed edge tables (scheme A: CSC-style delta + varint). Each level's
+coalesced, |dst|-sorted edges are encoded as a byte stream of groups
+$\langle$dst\--delta, gsize, (src\--delta, c)$^{gsize}\rangle$ (all LEB128 varints);
+per\--group boundaries let us store a handful of split points (byte offset +
+running dst) so the stream decodes in parallel. Typically $\sim3$ bytes/edge vs 16,
+so a 100\,GB table shrinks to $\sim$25\,GB -- it then fits in RAM, turning the
+disk\--bound SpMV into a cache\--bound one, and cuts memory traffic $\sim5\times$.
+
+@<Globals@>=
+unsigned char* cedge[MAXLEV]; long ced_len[MAXLEV];
+long* csoff[MAXLEV]; long* csdst[MAXLEV]; int csn[MAXLEV];
+
+@ @<Subroutines@>=
+static int vput(unsigned char*p,u64 x){ int n=0; while(x>=0x80){ p[n++]=(x&0x7f)|0x80; x>>=7; } p[n++]=(unsigned char)x; return n; }
+static u64 vget(unsigned char**pp){ unsigned char*p=*pp; u64 x=0; int sh=0; unsigned char b; do{ b=*p++; x|=(u64)(b&0x7f)<<sh; sh+=7; }while(b&0x80); *pp=p; return x; }
+void compress_table(const char*in,const char*out){
+  FILE*f=fopen(in,"rb"); if(!f){ fprintf(stderr,"cannot open %s\n",in); exit(1); }
+  int hdr[6]; if(fread(hdr,sizeof(int),6,f)!=6){fprintf(stderr,"bad table\n");exit(1);}
+  m=hdr[0];period_g=hdr[1];c0_g=hdr[2];Plevs=hdr[3];recend_col_g=hdr[4];direct_valid_col_g=hdr[5];
+  fread(&seedn,sizeof(long),1,f); seedv=xmalloc(seedn*sizeof(u128)); fread(seedv,sizeof(u128),seedn,f);
+  fread(nstate,sizeof(long),Plevs+1,f);
+  FILE*g=fopen(out,"wb");
+  fwrite(hdr,sizeof(int),6,g); fwrite(&seedn,sizeof(long),1,g); fwrite(seedv,sizeof(u128),seedn,g); fwrite(nstate,sizeof(long),Plevs+1,g);
+  long SPLIT=1L<<21; Edge* eb=0; long ebcap=0; unsigned char* ob=0; long obcap=0; int L;
+  for(L=0;L<Plevs;L++){
+    long ne; fread(&ne,sizeof(long),1,f);
+    if(ebcap<ne){ ebcap=ne; eb=xrealloc(eb,ebcap*sizeof(Edge)); }
+    if(ne) fread(eb,sizeof(Edge),ne,f);
+    if(obcap<ne*6+1024){ obcap=ne*6+1024; ob=xrealloc(ob,obcap); }
+    long olen=0, prev_dst=-1, since=0, e2=0; int scap=(int)(ne/SPLIT)+2;
+    long* soff=xmalloc(scap*sizeof(long)); long* sdst=xmalloc(scap*sizeof(long)); int sn=0;
+    while(e2<ne){
+      if(e2==0 || since>=SPLIT){ soff[sn]=olen; sdst[sn]=prev_dst; sn++; since=0; }
+      long dst=eb[e2].dst; olen+=vput(ob+olen,(u64)(dst-prev_dst));
+      long j=e2; while(j<ne && eb[j].dst==dst) j++; long gsize=j-e2;
+      olen+=vput(ob+olen,(u64)gsize);
+      long prev_src=0,k; for(k=e2;k<j;k++){ olen+=vput(ob+olen,(u64)(eb[k].src-prev_src)); prev_src=eb[k].src; olen+=vput(ob+olen,eb[k].c); }
+      prev_dst=dst; since+=gsize; e2=j;
+    }
+    fwrite(&olen,sizeof(long),1,g); fwrite(&sn,sizeof(int),1,g);
+    fwrite(soff,sizeof(long),sn,g); fwrite(sdst,sizeof(long),sn,g); if(olen) fwrite(ob,1,olen,g);
+    free(soff); free(sdst);
+    long ncp; fread(&ncp,sizeof(long),1,f); Comp*cp=xmalloc((ncp+1)*sizeof(Comp)); if(ncp) fread(cp,sizeof(Comp),ncp,f);
+    fwrite(&ncp,sizeof(long),1,g); if(ncp) fwrite(cp,sizeof(Comp),ncp,g); free(cp);
+  }
+  int nc; fread(&nc,sizeof(int),1,f); memset(cnt,0,sizeof(cnt)); fread(cnt,sizeof(u128),nc,f);
+  fwrite(&nc,sizeof(int),1,g); fwrite(cnt,sizeof(u128),nc,g);
+  free(eb); free(ob); fclose(f); fclose(g);
+  fprintf(stderr,"compressed %s -> %s\n",in,out);
+}
+int load_ctables(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return 0; int L,hdr[6];
+  if(fread(hdr,sizeof(int),6,f)!=6) return 0; m=hdr[0];period_g=hdr[1];c0_g=hdr[2];Plevs=hdr[3];recend_col_g=hdr[4];direct_valid_col_g=hdr[5];
+  fread(&seedn,sizeof(long),1,f); seedv=xmalloc(seedn*sizeof(u128)); fread(seedv,sizeof(u128),seedn,f);
+  fread(nstate,sizeof(long),Plevs+1,f);
+  for(L=0;L<Plevs;L++){ fread(&ced_len[L],sizeof(long),1,f); fread(&csn[L],sizeof(int),1,f);
+    csoff[L]=xmalloc((csn[L]+1)*sizeof(long)); csdst[L]=xmalloc((csn[L]+1)*sizeof(long));
+    fread(csoff[L],sizeof(long),csn[L],f); fread(csdst[L],sizeof(long),csn[L],f);
+    cedge[L]=xmalloc(ced_len[L]+16); fread(cedge[L],1,ced_len[L],f);
+    fread(&ncomp[L],sizeof(long),1,f); comps[L]=xmalloc((ncomp[L]+1)*sizeof(Comp)); fread(comps[L],sizeof(Comp),ncomp[L],f); }
+  int nc; fread(&nc,sizeof(int),1,f); memset(cnt,0,sizeof(cnt)); fread(cnt,sizeof(u128),nc,f);
+  fclose(f); return 1; }
+void spmv_run_batch_c(int Nto,u64* pr,int B){
+  int cc,b; long i;
+  if(c0_g<0||Plevs<=0){ for(cc=1;cc<=Nto;cc++) if(cc<=direct_valid_col_g){ printf("%d",cc);
+    for(b=0;b<B;b++) printf(" %llu",(unsigned long long)(u64)(cnt[cc*m]%pr[b])); printf("\n"); } return; }
+  u32* cnt2b=xcalloc((size_t)(1<<16)*B,sizeof(u32));
+  u32* v=xmalloc((size_t)nstate[0]*B*sizeof(u32));
+  for(i=0;i<nstate[0];i++){ u128 sd=seedv[i]; for(b=0;b<B;b++) v[i*B+b]=(u32)(sd%pr[b]); }
+  int basecol=c0_g+1;
+  while(basecol<=Nto){ int L;
+    for(L=0;L<Plevs;L++){ int abscol=basecol+L/m, substep=L%m; long e;
+      for(e=0;e<ncomp[L];e++){ int idx=abscol*m+substep+1+comps[L][e].delta; long sc=comps[L][e].src; u64 mult=comps[L][e].mult;
+        if(idx>=0&&idx<(1<<16)) for(b=0;b<B;b++){ size_t o=(size_t)idx*B+b; cnt2b[o]=(u32)(((u64)cnt2b[o]+(u64)v[(size_t)sc*B+b]*mult)%pr[b]); } }
+      u32* vn=xcalloc((size_t)nstate[L+1]*B,sizeof(u32));
+      int NT=omp_get_max_threads(),tt, SN=csn[L];
+#pragma omp parallel for schedule(dynamic,1)
+      for(tt=0;tt<NT;tt++){ int s0=(int)((long)tt*SN/NT), s1=(int)((long)(tt+1)*SN/NT); if(s1>SN)s1=SN;
+        if(s0<s1){ unsigned char* p=cedge[L]+csoff[L][s0];
+          unsigned char* endp=cedge[L]+(s1<SN? csoff[L][s1] : ced_len[L]);
+          long prev_dst=csdst[L][s0]; u64 acc[64]; int bb;
+          while(p<endp){ long dst=prev_dst+(long)vget(&p); long gsize=(long)vget(&p);
+            for(bb=0;bb<B;bb++) acc[bb]=0; long prev_src=0,gg;
+            for(gg=0;gg<gsize;gg++){ long src=prev_src+(long)vget(&p); prev_src=src; u64 c=vget(&p);
+              for(bb=0;bb<B;bb++) acc[bb]+=(u64)v[(size_t)src*B+bb]*c; }
+            for(bb=0;bb<B;bb++) vn[(size_t)dst*B+bb]=(u32)(acc[bb]%pr[bb]); prev_dst=dst; } } }
+      free(v); v=vn; }
+    basecol+=period_g; }
+  free(v);
+  for(cc=1;cc<=Nto;cc++){ printf("%d",cc);
+    for(b=0;b<B;b++){ u64 r=cc<=direct_valid_col_g?(u64)(cnt[cc*m]%pr[b]):(u64)cnt2b[(size_t)(cc*m)*B+b]; printf(" %llu",(unsigned long long)r); } printf("\n"); }
   free(cnt2b); }
 
 @* Main.
@@ -646,6 +744,9 @@ No arguments: self\--checks (direct sweep vs known values, and SpMV vs direct).
 @<Main@>=
 void spmv_run(int Nto,int crosscheck);
 void spmv_run_batch(int Nto,u64* pr,int B);
+void compress_table(const char*,const char*);
+int load_ctables(const char*);
+void spmv_run_batch_c(int Nto,u64* pr,int B);
 int build_extract(int mm,int Wb);
 int main(int argc,char*argv[]){
   start_mem_watcher();
@@ -665,6 +766,11 @@ int main(int argc,char*argv[]){
     if(!load_tables(argv[2])){ fprintf(stderr,"cannot load %s\n",argv[2]); return 1; }
     int B=argc-4; if(B>64) B=64; static u64 pr[64]; int b; for(b=0;b<B;b++) pr[b]=strtoull(argv[4+b],0,10);
     spmv_run_batch(atoi(argv[3]),pr,B); return 0; }
+  if(argc==4 && !strcmp(argv[1],"compress")){ compress_table(argv[2],argv[3]); return 0; }
+  if(argc>=5 && !strcmp(argv[1],"runbc")){ /* runbc cfile Nto p1 p2 ... : compressed table, batched */
+    if(!load_ctables(argv[2])){ fprintf(stderr,"cannot load %s\n",argv[2]); return 1; }
+    int B=argc-4; if(B>64) B=64; static u64 pr[64]; int b; for(b=0;b<B;b++) pr[b]=strtoull(argv[4+b],0,10);
+    spmv_run_batch_c(atoi(argv[3]),pr,B); return 0; }
   if(argc==4){ run_periodic(atoi(argv[1]),atoi(argv[2]),atoi(argv[3])); return 0; }
   /* A light smoke test: m=4 is tiny, and by transposition it also pins the m=6
      and m=7 values (4xc=cx4) without their million-state sweeps; one m=5 strip,
