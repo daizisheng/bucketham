@@ -207,8 +207,38 @@ long kuse;   /* vestigial: still written to the checkpoint stream (always 0) */
 Rec* trc[NTMAX]; long tnr[NTMAX], trcap[NTMAX];
 int g_keylen;   /* key length (=qnew) for the level currently being reduced */
 
+@ Hash aggregation (experimental, env |HASHAGG|; serial for now). Instead of
+emitting a full record per successor and sorting, each successor key is hashed on
+the fly to a distinct\--state id and only an 8\--byte |(dst,src)| edge is kept --
+so the emit pool (the build's memory peak) becomes an 8B/edge accumulator instead
+of a 24B/record one. The distinct keys are sorted once at the end so state ids
+stay canonical (the periodic replay needs the same id for the same state every
+period). In\--process only.
+
+@<Globals@>=
+int hashagg;
+static unsigned char* ha_keys; static long ha_n, ha_kcap;   /* distinct keys, insertion order */
+static long* ha_slot; static long ha_nslot;                 /* open\--addressing slots (id+1; 0=empty) */
+static u64* ha_ea; static long ha_ea_n, ha_ea_cap;          /* edge accumulator: (dst<<32)|src */
+static unsigned char* ha_sb; static int ha_sl;              /* sort context for the id permutation */
+
+@ @<Subroutines@>=
+static u64 ha_hash(unsigned char*k,int len){ u64 h=1469598103934665603ULL; int i; for(i=0;i<len;i++){ h^=k[i]; h*=1099511628211ULL; } return h; }
+static void ha_rehash(long ns){ ha_slot=xrealloc(ha_slot,ns*sizeof(long)); long i; for(i=0;i<ns;i++) ha_slot[i]=0; ha_nslot=ns;
+  long mask=ns-1,id; for(id=0;id<ha_n;id++){ u64 h=ha_hash(ha_keys+id*(long)ha_sl,ha_sl); long p=h&mask; while(ha_slot[p]) p=(p+1)&mask; ha_slot[p]=id+1; } }
+static long ha_get_or_add(unsigned char*key){ int len=g_keylen; ha_sl=len;
+  if(ha_n*10 >= ha_nslot*7) ha_rehash(ha_nslot? ha_nslot*2 : 4096);
+  long mask=ha_nslot-1; u64 h=ha_hash(key,len); long p=h&mask;
+  while(ha_slot[p]){ long id=ha_slot[p]-1; if(memcmp(ha_keys+id*(long)len,key,len)==0) return id; p=(p+1)&mask; }
+  long id=ha_n++; if((id+1)*(long)len>ha_kcap){ ha_kcap=ha_kcap*2+(long)len*4096; ha_keys=xrealloc(ha_keys,ha_kcap); }
+  memcpy(ha_keys+id*(long)len,key,len); ha_slot[p]=id+1; return id; }
+static inline void ha_ea_add(u64 e){ if(ha_ea_n>=ha_ea_cap){ ha_ea_cap=ha_ea_cap*2+65536; ha_ea=xrealloc(ha_ea,ha_ea_cap*sizeof(u64)); } ha_ea[ha_ea_n++]=e; }
+static int ha_idxcmp(const void*A,const void*B){ long a=*(const long*)A,b=*(const long*)B; return memcmp(ha_sb+a*ha_sl, ha_sb+b*ha_sl, ha_sl); }
+static int ha_u64cmp(const void*A,const void*B){ u64 a=*(const u64*)A,b=*(const u64*)B; return a<b?-1:a>b?1:0; }
+
 @ @<Subroutines@>=
 void emit(unsigned char*key,int len,long src){
+  if(hashagg){ long id=ha_get_or_add(key); ha_ea_add(((u64)id<<32)|(u32)src); return; }
   int t=omp_get_thread_num();
   if(tnr[t]>=trcap[t]){trcap[t]=trcap[t]*2+65536;trc[t]=xrealloc(trc[t],trcap[t]*sizeof(Rec));}
   Rec*R=&trc[t][tnr[t]++]; R->src=(int)src; memcpy(R->key,key,len); }
@@ -317,6 +347,38 @@ void sort_reduce(int s,int rec){
     reclev++; }
 }
 
+@ |hashagg_finalize| plays the role of |sort_reduce| for the hash path: the
+distinct keys are already deduplicated (in the hash), so we only sort them to a
+canonical order, remap the accumulated edges' |dst| through that permutation, and
+coalesce. In\--process only (no streaming yet).
+
+@<Subroutines@>=
+void hashagg_finalize(int rec){
+  long N=ha_n, len=g_keylen, i;
+  static long* idx=0; static long idxcap=0; if(idxcap<N+1){ idxcap=N+1; idx=xrealloc(idx,idxcap*sizeof(long)); }
+  for(i=0;i<N;i++) idx[i]=i;
+  ha_sb=ha_keys; ha_sl=(int)len; qsort(idx,N,sizeof(long),ha_idxcmp);
+  static int* perm=0; static long permcap=0; if(permcap<N+1){ permcap=N+1; perm=xrealloc(perm,permcap*sizeof(int)); }
+  for(i=0;i<N;i++) perm[idx[i]]=(int)i;
+  ncur=N; curoff=xrealloc(curoff,(N+1)*sizeof(long)); curkl=xrealloc(curkl,(N+1)*sizeof(int)); curkp=xrealloc(curkp,N*len+1);
+  for(i=0;i<N;i++){ memcpy(curkp+i*len, ha_keys+idx[i]*len, len); curoff[i]=i*len; curkl[i]=(int)len; }
+  if(rec){
+    for(i=0;i<ha_ea_n;i++){ u64 e=ha_ea[i]; long od=(long)(e>>32); u32 sr=(u32)e; ha_ea[i]=((u64)(u32)perm[od]<<32)|sr; }
+    qsort(ha_ea,ha_ea_n,sizeof(u64),ha_u64cmp);
+    Edge* eb=xmalloc((ha_ea_n+1)*sizeof(Edge)); long o=0,pp=0;
+    while(pp<ha_ea_n){ u32 dd=(u32)(ha_ea[pp]>>32), ss=(u32)ha_ea[pp]; u64 cc=0; long q=pp;
+      while(q<ha_ea_n && (u32)(ha_ea[q]>>32)==dd && (u32)ha_ea[q]==ss){cc++;q++;}
+      eb[o].src=(int)ss; eb[o].dst=(int)dd; eb[o].c=cc; o++; pp=q; }
+    edges[reclev]=eb; nedge[reclev]=o;
+    nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur; ncomp[reclev]=reccomp_n;
+    comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
+    reclev++;
+  }
+  if(getenv("BUILDMEM")) fprintf(stderr,"  [hamem] ea=%ld (%.2fGB 8B/edge) + keys %ld (%.2fGB) ; state=%ld\n",
+    ha_ea_n, ha_ea_n*8.0/1073741824.0, ha_n, ha_n*(double)len/1073741824.0, ncur);
+  ha_n=0; ha_ea_n=0; { long z; for(z=0;z<ha_nslot;z++) ha_slot[z]=0; }
+}
+
 @* The transfer step.
 The bucket holds states as (key,weight) over the previous frontier. To place
 cell~$s$: build the base mate table |bmate| over the new frontier (survivors
@@ -398,7 +460,7 @@ void run_step(int s,int rec){
   int nbr[16],rr=0; nbr[rr++]=apexnew;
   for(i=0;i<ND[s];i++){ int w=NB[s][i]; if(w>s && ifrnew[w]>=0) nbr[rr++]=ifrnew[w]; }
   for(i=0;i<qold;i++) o2n[i]=(frold[i]==s)?-1:ifrnew[frold[i]];
-  in_ncur_g=ncur; reccomp_n=0;
+  in_ncur_g=ncur; reccomp_n=0; g_keylen=qnew;
   @<Expand every state at cell |s|@>;
   @<Sort, reduce, and (if recording) capture the edge table@>;
 }
@@ -409,7 +471,7 @@ transition scratch (|mate|, |bmate|, |cycle|, |STEMP|) is |threadprivate|; each
 thread emits into its own pool; |cnt| is updated in a critical section.
 
 @<Expand every state at cell |s|@>=
-#pragma omp parallel for schedule(dynamic,32)
+#pragma omp parallel for schedule(dynamic,32) if(!hashagg)
 for(si=0;si<ncur;si++){
   int i,a,b,nl,deg,need,mp; unsigned char*ok=curkp+curoff[si]; int okl=curkl[si];
   int omate[MAXF]; unsigned char nk[MAXF];
@@ -436,7 +498,7 @@ for(si=0;si<ncur;si++){
 |sort_reduce|); |in_ncur_g| records the input level size for the edge table.
 
 @<Sort, reduce, and (if recording) capture the edge table@>=
-sort_reduce(s,rec);
+if(hashagg) hashagg_finalize(rec); else sort_reduce(s,rec);
 
 @* Checkpointing the build.
 The build (the sweep that discovers the periodic transfer) is the long part; we
@@ -527,6 +589,8 @@ int run_periodic(int mm,int Wb,int Next){
   sym_fold_on = getenv("SYMFOLD")?1:0;
   if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
   wfree = 1; Ltot_g=0;   /* weight-free replay is the only build mode now */
+  hashagg = getenv("HASHAGG")?1:0;
+  if(hashagg && stream_edges){ fprintf(stderr,"HASHAGG is in-process only for now\n"); exit(4); }
   recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
   int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
