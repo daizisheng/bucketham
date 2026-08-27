@@ -346,6 +346,7 @@ void sort_reduce(int s,int rec){
                  each range's byte length (cross-range dst-delta included) to place it
                  in the final buffer, pass 2 encodes into that slot -- no serial
                  bottleneck and no memory spike. */
+      double tc_=nowsec();
       static long rpd[NRNG], rolen[NRNG], roff[NRNG];
       for(r2=0;r2<P;r2++){ long pd=-1; int tt; for(tt=r2-1;tt>=0;tt--) if(rne2[tt]>0){ pd=re[tt][rne2[tt]-1].dst; break; } rpd[r2]=pd; }
 #pragma omp parallel for schedule(dynamic,1)
@@ -368,6 +369,7 @@ void sort_reduce(int s,int rec){
          so a decoder can start there and its writes never collide with another range's. */
       { int sn=0,r3; csoff[reclev]=xrealloc(csoff[reclev],(P+1)*sizeof(long)); csdst[reclev]=xrealloc(csdst[reclev],(P+1)*sizeof(long));
         for(r3=0;r3<P;r3++) if(rne2[r3]>0){ csoff[reclev][sn]=roff[r3]; csdst[reclev][sn]=rpd[r3]; sn++; } csn[reclev]=sn; }
+      t_compress+=nowsec()-tc_;
       comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
     }
     reclev++; }
@@ -459,6 +461,8 @@ int wfree, Ltot_g;   /* weight-free replay: record edge tables from col 0, itera
                         capturing a seed at c0. Ltot_g = total recorded levels (cols 0..c0+period). */
 int no_replay;       /* build only (leave the edge tables in RAM; the caller replays) */
 int exact_capture;   /* the replay fills cnt2 but prints nothing (residues read by the exact CRT driver) */
+static double nowsec(void);
+double t_expand, t_reduce, t_compress;   /* build-phase timers (seconds) */
 /* Aggressive recording: record only cols 0..aggr_R (the left-boundary transient)
    plus the periodic block, SKIPPING the middle cols R+1..c0. Every column's state
    set is a subset of the stable set (verified), and the transfer is bulk from a
@@ -513,8 +517,8 @@ void run_step(int s,int rec){
   for(i=0;i<ND[s];i++){ int w=NB[s][i]; if(w>s && ifrnew[w]>=0) nbr[rr++]=ifrnew[w]; }
   for(i=0;i<qold;i++) o2n[i]=(frold[i]==s)?-1:ifrnew[frold[i]];
   in_ncur_g=ncur; reccomp_n=0; g_keylen=qnew;
-  @<Expand every state at cell |s|@>;
-  @<Sort, reduce, and (if recording) capture the edge table@>;
+  { double te_=nowsec(); @<Expand every state at cell |s|@>@; t_expand+=nowsec()-te_; }
+  { double tr_=nowsec(); @<Sort, reduce, and (if recording) capture the edge table@>@; t_reduce+=nowsec()-tr_; }
 }
 
 @ Each state expands independently, so the loop runs in parallel (except while
@@ -641,6 +645,7 @@ int run_periodic(int mm,int Wb,int Next){
   sym_fold_on = getenv("SYMFOLD")?1:0;
   if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
   wfree = 1; Ltot_g=0;   /* weight-free replay is the only build mode now */
+  t_expand=t_reduce=t_compress=0;
   hashagg = getenv("HASHAGG")?1:0;
   aggr_R = getenv("AGGR")? atoi(getenv("AGGR")) : -1;   /* aggressive: record only cols 0..AGGR + periodic block */
   if(hashagg && stream_edges){ fprintf(stderr,"HASHAGG is in-process only for now\n"); exit(4); }
@@ -1080,7 +1085,8 @@ void exact_mode(int mm,int N){
   fprintf(stderr,"exact m=%d to n=%d : %d primes (product > 2^%d, bound < 2^%d)\n",mm,N,nP,31*nP,3*mm*N);
   double t0=nowsec();
   no_replay=1; MODP=0; run_periodic(mm,Wb,N);   /* build the edge tables in RAM, no replay */
-  double tb=nowsec(); fprintf(stderr,"[time] build %.1fs\n",tb-t0);
+  double tb=nowsec(); fprintf(stderr,"[time] build %.1fs  (expand %.1fs, reduce %.1fs [of which compress %.1fs])\n",
+    tb-t0, t_expand, t_reduce, t_compress);
   no_replay=0;
   static u32* resid=0; resid=xrealloc(resid,(size_t)nP*(N+1)*sizeof(u32));
   long maxns=1; { int L; for(L=0;L<=Ltot_g;L++) if(nstate[L]>maxns) maxns=nstate[L]; }
