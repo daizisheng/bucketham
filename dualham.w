@@ -1070,13 +1070,16 @@ void exact_mode(int mm,int N){
      (2 x maxns x Bp x 4B per concurrent batch) against what's LEFT under the cap. */
   long cap = mem_cap_bytes>0? mem_cap_bytes : (100L<<30);
   long budget = cap - rss_bytes() - (8L<<30);   /* leave 8GB headroom */
-  long perbatch = (long)maxns*Bp*8L + (1L<<20);
-  while(Bp>1 && budget < perbatch){ Bp/=2; perbatch=(long)maxns*Bp*8L+(1L<<20); }   /* shrink the batch if even one won't fit */
-  int NTr=(int)(budget/perbatch); if(NTr<1)NTr=1; if(NTr>omp_get_max_threads())NTr=omp_get_max_threads();
-  /* if batches < threads, shrink Bp to fill the cores (each batch is smaller, so more also fit) */
-  if((nP+Bp-1)/Bp < NTr){ int Bn=(nP+NTr-1)/NTr; if(Bn<1)Bn=1; if(Bn<Bp) Bp=Bn;
-    perbatch=(long)maxns*Bp*8L+(1L<<20); NTr=(int)(budget/perbatch); if(NTr<1)NTr=1; if(NTr>omp_get_max_threads())NTr=omp_get_max_threads(); }
+  int ompmax=omp_get_max_threads();
+  /* Choose Bp so #batches ~= the cores memory allows: this fills the cores while
+     keeping Bp as LARGE as possible (each edge decode is amortised over Bp primes).
+     The decode is the cost, so fewer, fatter batches beat many single-prime ones. */
+  int NTr1=(int)(budget/((long)maxns*8L+(1L<<20))); if(NTr1<1)NTr1=1; if(NTr1>ompmax)NTr1=ompmax;
+  Bp=(nP+NTr1-1)/NTr1; if(Bp<1)Bp=1;
+  long perbatch=(long)maxns*Bp*8L+(1L<<20);
+  while(Bp>1 && budget<perbatch){ Bp--; perbatch=(long)maxns*Bp*8L+(1L<<20); }   /* ensure one batch fits */
   int nbatch=(nP+Bp-1)/Bp, bi;
+  int NTr=(int)(budget/perbatch); if(NTr<1)NTr=1; if(NTr>ompmax)NTr=ompmax; if(NTr>nbatch)NTr=nbatch;
   fprintf(stderr,"replay: %d primes, %d batches of %d, %d parallel (maxns=%ld, budget %.0fGB)\n",nP,nbatch,Bp,NTr,maxns,budget/1073741824.0);
 #pragma omp parallel for schedule(dynamic,1) num_threads(NTr)
   for(bi=0;bi<nbatch;bi++){ int base=bi*Bp, bb=nP-base; if(bb>Bp)bb=Bp;
