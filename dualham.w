@@ -223,6 +223,7 @@ static u64* ha_ea; static long ha_ea_n, ha_ea_cap;          /* edge accumulator:
 static unsigned char* ha_sb; static int ha_sl;              /* sort context for the id permutation */
 
 @ @<Subroutines@>=
+static int vput(unsigned char*p,u64 x); static u64 vget(unsigned char**pp);   /* LEB128 varints (defined with the compressed tables); used here to encode/decode edges */
 static u64 ha_hash(unsigned char*k,int len){ u64 h=1469598103934665603ULL; int i; for(i=0;i<len;i++){ h^=k[i]; h*=1099511628211ULL; } return h; }
 static void ha_rehash(long ns){ ha_slot=xrealloc(ha_slot,ns*sizeof(long)); long i; for(i=0;i<ns;i++) ha_slot[i]=0; ha_nslot=ns;
   long mask=ns-1,id; for(id=0;id<ha_n;id++){ u64 h=ha_hash(ha_keys+id*(long)ha_sl,ha_sl); long p=h&mask; while(ha_slot[p]) p=(p+1)&mask; ha_slot[p]=id+1; } }
@@ -338,10 +339,19 @@ void sort_reduce(int s,int rec){
       fwrite(&reccomp_n,sizeof(long),1,rec_fp); fwrite(reccomp_buf,sizeof(Comp),reccomp_n,rec_fp);
       if(ferror(rec_fp)){ fprintf(stderr,"disk write error on %s (out of space?)\n",rec_path); exit(3); }
       edges[reclev]=0; comps[reclev]=0;
-    } else {  /* in-process: consolidate into one array for the in-RAM SpMV */
-      Edge* eb=xmalloc((o+1)*sizeof(Edge)); long enb=0;
-      for(r2=0;r2<P;r2++){ long j; for(j=0;j<rne2[r2];j++) eb[enb++]=re[r2][j]; }
-      edges[reclev]=eb;
+    } else {  /* in-process: compress the coalesced, dst-sorted edges (scheme-A varints)
+                 straight into RAM -- ~4-6 B/edge instead of a raw 16 B Edge, so the
+                 from-col-0 edge tables fit in memory (e.g. m=7 in 128 GB). The ranges
+                 are disjoint dst-ordered blocks, so a single pass encodes them. */
+      long cap=o*8+4096; unsigned char* ob=xmalloc(cap); long olen=0, prev_dst=-1;
+      for(r2=0;r2<P;r2++){ long e2=0;
+        while(e2<rne2[r2]){ if(olen+64>cap){ cap=cap*2; ob=xrealloc(ob,cap); }
+          long dst=re[r2][e2].dst; olen+=vput(ob+olen,(u64)(dst-prev_dst));
+          long j=e2; while(j<rne2[r2] && re[r2][j].dst==dst) j++; olen+=vput(ob+olen,(u64)(j-e2));
+          long prev_src=0,k; for(k=e2;k<j;k++){ if(olen+32>cap){ cap=cap*2; ob=xrealloc(ob,cap); }
+            olen+=vput(ob+olen,(u64)(re[r2][k].src-prev_src)); prev_src=re[r2][k].src; olen+=vput(ob+olen,re[r2][k].c); }
+          prev_dst=dst; e2=j; } }
+      cedge[reclev]=ob; ced_len[reclev]=olen; edges[reclev]=0;
       comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
     }
     reclev++; }
@@ -362,20 +372,32 @@ void hashagg_finalize(int rec){
   for(i=0;i<N;i++) perm[idx[i]]=(int)i;
   ncur=N; curoff=xrealloc(curoff,(N+1)*sizeof(long)); curkl=xrealloc(curkl,(N+1)*sizeof(int)); curkp=xrealloc(curkp,N*len+1);
   for(i=0;i<N;i++){ memcpy(curkp+i*len, ha_keys+idx[i]*len, len); curoff[i]=i*len; curkl[i]=(int)len; }
+  long o=0;
   if(rec){
     for(i=0;i<ha_ea_n;i++){ u64 e=ha_ea[i]; long od=(long)(e>>32); u32 sr=(u32)e; ha_ea[i]=((u64)(u32)perm[od]<<32)|sr; }
     qsort(ha_ea,ha_ea_n,sizeof(u64),ha_u64cmp);
-    Edge* eb=xmalloc((ha_ea_n+1)*sizeof(Edge)); long o=0,pp=0;
-    while(pp<ha_ea_n){ u32 dd=(u32)(ha_ea[pp]>>32), ss=(u32)ha_ea[pp]; u64 cc=0; long q=pp;
-      while(q<ha_ea_n && (u32)(ha_ea[q]>>32)==dd && (u32)ha_ea[q]==ss){cc++;q++;}
-      eb[o].src=(int)ss; eb[o].dst=(int)dd; eb[o].c=cc; o++; pp=q; }
-    edges[reclev]=eb; nedge[reclev]=o;
+    /* Encode scheme-A varints DIRECTLY from the sorted accumulator -- coalesce on
+       the fly, no raw 16B-Edge intermediate (that was the finalize memory spike).
+       Buffer grows from ~8B/edge; the compressed edges then live in RAM at
+       ~6B/edge instead of 16B. */
+    long cap=ha_ea_n*8+4096; unsigned char* ob=xmalloc(cap); long olen=0, prev_dst=-1, pp=0;
+    while(pp<ha_ea_n){
+      if(olen+64>cap){ cap=cap*2; ob=xrealloc(ob,cap); }
+      u32 dd=(u32)(ha_ea[pp]>>32); long j=pp; while(j<ha_ea_n && (u32)(ha_ea[j]>>32)==dd) j++;
+      long gsize=0,k=pp; while(k<j){ u32 s=(u32)ha_ea[k]; long q=k; while(q<j&&(u32)ha_ea[q]==s)q++; gsize++; k=q; }
+      olen+=vput(ob+olen,(u64)((long)dd-prev_dst)); olen+=vput(ob+olen,(u64)gsize);
+      long prev_src=0; k=pp;
+      while(k<j){ if(olen+32>cap){ cap=cap*2; ob=xrealloc(ob,cap); } u32 s=(u32)ha_ea[k]; long q=k; u64 c=0; while(q<j&&(u32)ha_ea[q]==s){c++;q++;}
+        olen+=vput(ob+olen,(u64)((long)s-prev_src)); prev_src=s; olen+=vput(ob+olen,c); o++; k=q; }
+      prev_dst=dd; pp=j;
+    }
+    cedge[reclev]=ob; ced_len[reclev]=olen; edges[reclev]=0; nedge[reclev]=o;
     nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur; ncomp[reclev]=reccomp_n;
     comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
     reclev++;
   }
-  if(getenv("BUILDMEM")) fprintf(stderr,"  [hamem] ea=%ld (%.2fGB 8B/edge) + keys %ld (%.2fGB) ; state=%ld\n",
-    ha_ea_n, ha_ea_n*8.0/1073741824.0, ha_n, ha_n*(double)len/1073741824.0, ncur);
+  if(getenv("BUILDMEM")) fprintf(stderr,"  [hamem] ea=%ld (%.2fGB 8B) -> comp %.2fGB (%.1fB/edge) + keys %.2fGB ; state=%ld\n",
+    ha_ea_n, ha_ea_n*8.0/1073741824.0, rec?ced_len[reclev-1]/1073741824.0:0.0, (rec&&o)?(double)ced_len[reclev-1]/o:0.0, ha_n*(double)len/1073741824.0, ncur);
   ha_n=0; ha_ea_n=0; { long z; for(z=0;z<ha_nslot;z++) ha_slot[z]=0; }
 }
 
@@ -416,6 +438,8 @@ long nstate[MAXLEV+1]; int Plevs;
 int wfree, Ltot_g;   /* weight-free replay: record edge tables from col 0, iterate SpMV
                         from the trivial start [1] (regenerates all weights) instead of
                         capturing a seed at c0. Ltot_g = total recorded levels (cols 0..c0+period). */
+int no_replay;       /* build only (leave the edge tables in RAM; the caller replays) */
+int exact_capture;   /* the replay fills cnt2 but prints nothing (residues read by the exact CRT driver) */
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int direct_valid_col_g;             /* direct |cnt| is exact for columns $\le$ this */
 int stop_after_record=0; int direct_cov_g=0;
@@ -591,6 +615,7 @@ int run_periodic(int mm,int Wb,int Next){
   wfree = 1; Ltot_g=0;   /* weight-free replay is the only build mode now */
   hashagg = getenv("HASHAGG")?1:0;
   if(hashagg && stream_edges){ fprintf(stderr,"HASHAGG is in-process only for now\n"); exit(4); }
+  { int L; for(L=0;L<MAXLEV;L++){ if(cedge[L]){free(cedge[L]);cedge[L]=0;} edges[L]=0; ced_len[L]=0; nedge[L]=0; } }  /* fresh run: clear per-level edge stores */
   recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
   int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
@@ -622,10 +647,11 @@ int run_periodic(int mm,int Wb,int Next){
     if(s%m==m-1 && getenv("DBG")) fprintf(stderr,"  col %d ncur=%ld rec=%d\n",s/m,ncur,recording);
     if(!recording && s%m==m-1 && (s/m)%ckpt_every==0) save_ckpt(s+1);
     if(recording && s==seam_break && stop_after_record) break;
+    if(wfree && recording && recend>=0 && s>=recend) break;  /* wfree: nothing to sweep past the recorded block */
   }
   @<Finalize direct coverage and verify periodicity@>@;
   direct_cov_g = stop_after_record ? direct_valid_col_g : n;
-  if(!stream_edges) spmv_run(Next, 1);   /* streamed edges are freed; SpMV via a separate `run` */
+  if(!stream_edges && !no_replay) spmv_run(Next, 1);   /* streamed edges are freed; SpMV via a separate `run` */
   return c0;
 }
 
@@ -691,7 +717,7 @@ void spmv_run(int Nto,int crosscheck){
   int i; memset(cnt2,0,sizeof(cnt2));
   @<Iterate the SpMV out to column $N$@>;
   { int cc;  /* weight-free: every column comes from the replay */
-    for(cc=1;cc<=Nto;cc++){ u64 val=cnt2[cc*m]; if(val) printf("open %dx%d = %llu\n",m,cc,val); }
+    if(!exact_capture) for(cc=1;cc<=Nto;cc++){ u64 val=cnt2[cc*m]; if(val) printf("open %dx%d = %llu\n",m,cc,val); }
     return; }
   { int good=1,cc;
     if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=direct_cov_g;cc++) if((u64)cnt[cc*m]!=cnt2[cc*m]){ good=0;
@@ -707,8 +733,11 @@ if(wfree && Ltot_g>0){
      periodic block. Regenerates every weight and completion; no seed needed. */
 #define APPLY(LL,ACOL,SUB) do{ int L_=(LL),abscol_=(ACOL),substep_=(SUB); long e_; \
     for(e_=0;e_<ncomp[L_];e_++){ int idx_=abscol_*m+substep_+1+comps[L_][e_].delta; cnt2[idx_]=red(cnt2[idx_]+(u128)v[comps[L_][e_].src]*comps[L_][e_].mult); } \
-    u64* vn_=xcalloc(nstate[L_+1],sizeof(u64)); long ne_=nedge[L_],e2_; \
-    for(e2_=0;e2_<ne_;e2_++){ int d_=edges[L_][e2_].dst; vn_[d_]=red(vn_[d_]+(u128)v[edges[L_][e2_].src]*edges[L_][e2_].c); } \
+    u64* vn_=xcalloc(nstate[L_+1],sizeof(u64)); \
+    if(cedge[L_]){ unsigned char* p_=cedge[L_], *end_=p_+ced_len[L_]; long dst_=-1; \
+      while(p_<end_){ dst_+=(long)vget(&p_); long gs_=(long)vget(&p_),g_,src_=0; \
+        for(g_=0;g_<gs_;g_++){ src_+=(long)vget(&p_); u64 c_=vget(&p_); vn_[dst_]=red(vn_[dst_]+(u128)v[src_]*c_); } } } \
+    else { long ne_=nedge[L_],e2_; for(e2_=0;e2_<ne_;e2_++){ int d_=edges[L_][e2_].dst; vn_[d_]=red(vn_[d_]+(u128)v[edges[L_][e2_].src]*edges[L_][e2_].c); } } \
     free(v); v=vn_; }while(0)
   u64* v=xcalloc(nstate[0],sizeof(u64)); v[0]=1; int L;
   for(L=0;L<Ltot_g;L++) APPLY(L, L/m, L%m);            /* prefix: cols 0..recend_col */
@@ -912,8 +941,90 @@ void compress_table(const char*,const char*);
 int load_ctables(const char*);
 void spmv_run_batch_c(int Nto,u64* pr,int B);
 int build_extract(int mm,int Wb);
+@* Exact big integers in one shot: build once, CRT over hard\--wired primes.
+The build extracts the (prime\--agnostic) edge tables once; we then replay the
+weight\--free SpMV once per prime |p_b| (mod |p_b|) and Garner\--combine the
+residues into an exact big integer per column -- all in RAM, no disk. The number
+of primes is fixed by a rigorous bound: an open tour is a permutation of the
+$mn$ cells whose consecutive cells are knight\--adjacent (degree $\le 8$), so
+there are fewer than $8^{mn}<2^{3mn}$ of them; with 31\--bit primes that needs
+$K=\lceil 3mn/31\rceil$, and we take a few extra so that {\it dropping\/} the
+extras leaves every value unchanged (an empirical confirmation of exactness).
+
+@<Subroutines@>=
+static u64 modpowu(u64 a,u64 e,u64 p){ u64 x=1; a%=p; while(e){ if(e&1) x=(u128)x*a%p; a=(u128)a*a%p; e>>=1; } return x; }
+static int isprime(u64 n){ u64 q; if(n<2) return 0; for(q=2;q<40&&q*q<=n;q++) if(n%q==0) return n==q;
+  u64 d=n-1; int r=0,i,j; while(!(d&1)){ d>>=1; r++; }
+  u64 A[]={2,3,5,7,11,13,17,19,23,29,31,37};
+  for(i=0;i<12;i++){ u64 a=A[i]%n; if(!a) continue; u64 x=modpowu(a,d,n); if(x==1||x==n-1) continue; int ok=0;
+    for(j=0;j<r-1;j++){ x=(u128)x*x%n; if(x==n-1){ok=1;break;} } if(!ok) return 0; }
+  return 1; }
+static int gen_primes(u64*pr,int K){ int n=0; u64 x=(1ULL<<31)-1; while(n<K && x>2){ if(isprime(x)) pr[n++]=x; x-=2; } return n; }
+static u64 modinv(u64 a,u64 p){ return modpowu(a%p,p-2,p); }
+@#
+#define BNCAP 4096
+typedef struct{ u32 d[BNCAP]; int n; } BN;   /* little-endian, base $10^9$ */
+static void bn_setu64(BN*x,u64 v){ x->n=0; while(v){ x->d[x->n++]=(u32)(v%1000000000ULL); v/=1000000000ULL; } if(!x->n){x->d[0]=0;x->n=1;} }
+static u32 bn_mod(const BN*x,u64 p){ u64 r=0; int i; for(i=x->n-1;i>=0;i--) r=(r*1000000000ULL + x->d[i])%p; return (u32)r; }
+static void bn_mulsmall(BN*x,u64 s){ u64 c=0; int i; for(i=0;i<x->n;i++){ u64 v=(u64)x->d[i]*s+c; x->d[i]=(u32)(v%1000000000ULL); c=v/1000000000ULL; } while(c){ x->d[x->n++]=(u32)(c%1000000000ULL); c/=1000000000ULL; } }
+static void bn_addmul(BN*x,const BN*M,u64 t){ u64 c=0; int i,n=x->n>M->n?x->n:M->n; for(i=0;i<n||c;i++){ u64 v=c; if(i<x->n)v+=x->d[i]; if(i<M->n)v+=(u64)M->d[i]*t; x->d[i]=(u32)(v%1000000000ULL); c=v/1000000000ULL; } if(i>x->n)x->n=i; while(x->n>1 && x->d[x->n-1]==0) x->n--; }
+static void bn_print(const BN*x){ int i; printf("%u",x->d[x->n-1]); for(i=x->n-2;i>=0;i--) printf("%09u",x->d[i]); }
+
+@ Batched weight-free replay: apply |B| primes in ONE pass over the (compressed)
+edge tables, with interleaved |u32| vectors |v[i*B+b]| and Barrett reduction --
+so the expensive edge decode is amortised across |B| residues (|K/B| passes for
+|K| primes instead of |K|). Fills |cnt2b_g| (residues, indexed |(col)*B+b|).
+
+@<Globals@>=
+u32* cnt2b_g;
+
+@ @<Subroutines@>=
+void wfree_replay_batch(int Nto,u64*pr,int B){
+  int b; static u64 mu[64]; for(b=0;b<B;b++) mu[b]=(u64)((((u128)1)<<64)/pr[b]);
+  size_t vcols=(size_t)((Nto+3)*m+8), cbsz=vcols*B;   /* the periodic repeat can touch col Nto+1 */
+  cnt2b_g=xrealloc(cnt2b_g,cbsz*sizeof(u32)); memset(cnt2b_g,0,cbsz*sizeof(u32));
+  u32* v=xcalloc((size_t)nstate[0]*B,sizeof(u32)); for(b=0;b<B;b++) v[b]=1;
+#define APPLYB(LL,ACOL,SUB) do{ int L_=(LL),abscol_=(ACOL),substep_=(SUB); long e_; \
+    for(e_=0;e_<ncomp[L_];e_++){ size_t idx_=(size_t)(abscol_*m+substep_+1+comps[L_][e_].delta)*B; long sc_=comps[L_][e_].src; u64 mult_=comps[L_][e_].mult; \
+      for(b=0;b<B;b++){ cnt2b_g[idx_+b]=barr((u64)cnt2b_g[idx_+b]+(u64)v[(size_t)sc_*B+b]*mult_,pr[b],mu[b]); } } \
+    u32* vn_=xcalloc((size_t)nstate[L_+1]*B,sizeof(u32)); \
+    unsigned char* p_=cedge[L_], *end_=p_+ced_len[L_]; long dst_=-1; \
+    while(p_<end_){ dst_+=(long)vget(&p_); long gs_=(long)vget(&p_),g_,src_=0; \
+      for(g_=0;g_<gs_;g_++){ src_+=(long)vget(&p_); u64 c_=vget(&p_); size_t di=(size_t)dst_*B, si=(size_t)src_*B; \
+        for(b=0;b<B;b++){ vn_[di+b]=barr((u64)vn_[di+b]+(u64)v[si+b]*c_,pr[b],mu[b]); } } } \
+    free(v); v=vn_; }while(0)
+  int L; for(L=0;L<Ltot_g;L++) APPLYB(L,L/m,L%m);
+  int basecol=recend_col_g+1;
+  while(basecol<=Nto){ int j; for(j=0;j<Plevs;j++) APPLYB(Ltot_g-Plevs+j, basecol+j/m, j%m); basecol+=period_g; }
+  free(v);
+#undef APPLYB
+}
+
+@ @<Subroutines@>=
+void exact_mode(int mm,int N){
+  int Wb=20, b, c; int K=(3*mm*N)/31 + 6;   /* rigorous bound + slack for the drop-a-prime check */
+  static u64 pr[512]; if(K>500)K=500; int nP=gen_primes(pr,K);
+  fprintf(stderr,"exact m=%d to n=%d : %d primes (product > 2^%d, bound < 2^%d)\n",mm,N,nP,31*nP,3*mm*N);
+  no_replay=1; MODP=0; run_periodic(mm,Wb,N);   /* build the edge tables in RAM, no replay */
+  no_replay=0;
+  static u32* resid=0; resid=xrealloc(resid,(size_t)nP*(N+1)*sizeof(u32));
+  int Bp=16, base;   /* apply Bp primes per edge-decode pass */
+  for(base=0;base<nP;base+=Bp){ int bb=nP-base; if(bb>Bp)bb=Bp;
+    wfree_replay_batch(N,pr+base,bb);
+    for(c=1;c<=N;c++) for(b=0;b<bb;b++) resid[(size_t)(base+b)*(N+1)+c]=cnt2b_g[(size_t)(c*m)*bb+b]; }
+  for(c=1;c<=N;c++){
+    BN x,M; bn_setu64(&x,resid[c]); bn_setu64(&M,pr[0]);
+    for(b=1;b<nP;b++){ u64 p=pr[b], xm=bn_mod(&x,p);
+      u64 t=(u64)((u128)((resid[(size_t)b*(N+1)+c]+p-xm)%p) * modinv(bn_mod(&M,p),p) % p);
+      bn_addmul(&x,&M,t); bn_mulsmall(&M,p); }
+    printf("open %dx%d = ",mm,c); bn_print(&x); printf("\n");
+  }
+}
+
+@ @<Subroutines@>=
 int main(int argc,char*argv[]){
   start_mem_watcher();
+  if(argc==4 && !strcmp(argv[1],"exact")){ exact_mode(atoi(argv[2]),atoi(argv[3])); return 0; }  /* exact m N : one program, from scratch to open m x 1..N as exact big integers, all in RAM */
   if(argc>=5 && !strcmp(argv[1],"build")){ /* build m Wb file [ckpt] : build+extract, dump tables */
     stop_after_record=1; stream_edges=1; snprintf(rec_path,sizeof rec_path,"%s",argv[4]);
     if(argc>=6) ckpt_path=argv[5]; if(argc>=7) ckpt_every=atoi(argv[6]);
