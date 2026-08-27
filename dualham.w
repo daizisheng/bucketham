@@ -186,34 +186,33 @@ Each step emits successor records; we sort by key and merge equal keys. |src|
 carries the emitting state's index, used only while recording the edge tables.
 
 @<Types@>=
-typedef struct { long off; int len; u128 w; long src; } Rec;
+/* The record carries its key INLINE (keys are $\le 2m+1$ bytes; |KEYMAX| holds
+   $m\le 9$), so there is no separate key pool to allocate/copy and the sort's
+   |memcmp| hits contiguous memory instead of chasing a pointer. The weight is
+   split into two |u64| halves so the struct is 8-byte, not 16-byte, aligned --
+   a u128 member would pad the record to 48 bytes. All records of one level share
+   the same key length |g_keylen| (=|qnew|), so no per-record |len| is stored.
+   Net: 48 bytes + a 13-byte pooled key -> 40 bytes self-contained. */
+#define KEYMAX 20
+typedef struct { u64 wlo,whi; int src; unsigned char key[KEYMAX]; } Rec;
+#define RECW(R) (((u128)(R)->whi<<64)|(R)->wlo)
 
 @ @<Globals@>=
-unsigned char*kp; long kcap,kuse; Rec*rc; long nr,rcap; unsigned char*cb;
+long kuse;   /* vestigial: still written to the checkpoint stream (always 0) */
 @#
 #define NTMAX 128
-unsigned char* tkp[NTMAX]; long tkuse[NTMAX], tkcap[NTMAX];
 Rec* trc[NTMAX]; long tnr[NTMAX], trcap[NTMAX];
-int rcmp(const void*A,const void*B){ const Rec*a=A,*b=B; int l=a->len<b->len?a->len:b->len;
-  int d=memcmp(cb+a->off,cb+b->off,l); return d?d:a->len-b->len; }
+int g_keylen;   /* key length (=qnew) for the level currently being reduced */
 
 @ @<Subroutines@>=
 void emit(unsigned char*key,int len,u128 w,long src){
   int t=omp_get_thread_num();
-  if(tkuse[t]+len>tkcap[t]){tkcap[t]=tkcap[t]*2+len+65536;tkp[t]=xrealloc(tkp[t],tkcap[t]);}
   if(tnr[t]>=trcap[t]){trcap[t]=trcap[t]*2+65536;trc[t]=xrealloc(trc[t],trcap[t]*sizeof(Rec));}
-  memcpy(tkp[t]+tkuse[t],key,len); trc[t][tnr[t]].off=tkuse[t]; trc[t][tnr[t]].len=len;
-  trc[t][tnr[t]].w=w; trc[t][tnr[t]].src=src; tkuse[t]+=len; tnr[t]++; }
-void merge_pools(void){ int t; long r; nr=0; kuse=0;
-  for(t=0;t<omp_get_max_threads();t++){ for(r=0;r<tnr[t];r++){ Rec*R=&trc[t][r];
-    if(kuse+R->len>kcap){kcap=kcap*2+R->len+65536;kp=xrealloc(kp,kcap);}
-    if(nr>=rcap){rcap=rcap*2+65536;rc=xrealloc(rc,rcap*sizeof(Rec));}
-    memcpy(kp+kuse,tkp[t]+R->off,R->len);
-    rc[nr].off=kuse; rc[nr].len=R->len; rc[nr].w=R->w; rc[nr].src=R->src; kuse+=R->len; nr++; }
-    tnr[t]=0; tkuse[t]=0; } }
+  Rec*R=&trc[t][tnr[t]++]; R->wlo=(u64)w; R->whi=(u64)(w>>64); R->src=(int)src;
+  memcpy(R->key,key,len); }
 @#
-int rcmp_r(const void*A,const void*B,void*arg){ unsigned char*base=arg; const Rec*a=A,*b=B;
-  int l=a->len<b->len?a->len:b->len; int d=memcmp(base+a->off,base+b->off,l); return d?d:a->len-b->len; }
+int rcmp_r(const void*A,const void*B,void*arg){ (void)arg; const Rec*a=A,*b=B;
+  return memcmp(a->key,b->key,g_keylen); }
 @#
 /* sort each thread's records in parallel, then merge+reduce across them in one
    pass (keeping global sort order so periodic ids stay consistent), capturing
@@ -235,35 +234,41 @@ static Edge* re[NRNG]; static long rne[NRNG], recap[NRNG];
 static long bnd[NTMAX][NRNG+1];
 void sort_reduce(int s,int rec){
   int NT=omp_get_max_threads(), t, r; long i;
+  g_keylen=qnew;
+  if(g_keylen>KEYMAX){ fprintf(stderr,"KEYMAX=%d too small for qnew=%d (m=%d); raise KEYMAX and rebuild\n",KEYMAX,qnew,m); exit(4); }
 #pragma omp parallel for schedule(dynamic,1)
-  for(t=0;t<NT;t++) if(tnr[t]) qsort_r(trc[t],tnr[t],sizeof(Rec),rcmp_r,tkp[t]);
+  for(t=0;t<NT;t++) if(tnr[t]) qsort_r(trc[t],tnr[t],sizeof(Rec),rcmp_r,0);
   long tot=0; for(t=0;t<NT;t++) tot+=tnr[t];
+  if(getenv("BUILDMEM")){
+    fprintf(stderr,"  [mem s=%d] emit recs=%ld (%.2fGB Rec, inline key len %d) ; state ncur=%ld (%.2fGB)\n",
+      s, tot, tot*(double)sizeof(Rec)/1073741824.0, g_keylen, ncur,
+      ncur*(double)(sizeof(long)+sizeof(int)+sizeof(u128))/1073741824.0); }
   int P=NT*8; if(P>NRNG) P=NRNG; if(P<1) P=1; if((long)P>tot && tot>0) P=(int)tot;
   int S=P*8; if((long)S>tot) S=(int)tot;
   static Samp* samp=0; static long sampcap=0; if(sampcap<S+1){ sampcap=S+1; samp=xrealloc(samp,sampcap*sizeof(Samp)); }
   long sc=0;
   for(t=0;t<NT && tot>0;t++){ long nt=tnr[t]; if(nt==0) continue; long take=(long)((double)S*nt/tot); if(take<1) take=1; long j;
-    for(j=0;j<take && sc<S;j++){ long idx=(long)((double)j*nt/take); if(idx>=nt) idx=nt-1; Rec*R=&trc[t][idx]; samp[sc].k=tkp[t]+R->off; samp[sc].len=R->len; sc++; } }
+    for(j=0;j<take && sc<S;j++){ long idx=(long)((double)j*nt/take); if(idx>=nt) idx=nt-1; Rec*R=&trc[t][idx]; samp[sc].k=R->key; samp[sc].len=g_keylen; sc++; } }
   S=(int)sc; qsort(samp,S,sizeof(Samp),sampcmp);
   static Samp spl[NRNG]; int np=0, p;
   for(p=1;p<P;p++){ long si=(long)((double)p*S/P); if(si>=S) si=S-1; if(S>0) spl[np++]=samp[si]; }
   for(t=0;t<NT;t++){ bnd[t][0]=0; bnd[t][P]=tnr[t];
     for(p=0;p<np;p++){ long lo=0,hi=tnr[t]; while(lo<hi){ long mid=(lo+hi)/2; Rec*R=&trc[t][mid];
-      if(keycmp(tkp[t]+R->off,R->len,spl[p].k,spl[p].len)<0) lo=mid+1; else hi=mid; } bnd[t][p+1]=lo; } }
+      if(keycmp(R->key,g_keylen,spl[p].k,spl[p].len)<0) lo=mid+1; else hi=mid; } bnd[t][p+1]=lo; } }
 #pragma omp parallel for schedule(dynamic,1)
   for(r=0;r<P;r++){
     int hp[NTMAX]; long hpos[NTMAX]; int hn=0, tt;
     for(tt=0;tt<NT;tt++) hpos[tt]=bnd[tt][r];
-#define RLESS(a,b) ({ Rec*Ra=&trc[a][hpos[a]],*Rb=&trc[b][hpos[b]]; keycmp(tkp[a]+Ra->off,Ra->len,tkp[b]+Rb->off,Rb->len)<0; })
+#define RLESS(a,b) ({ Rec*Ra=&trc[a][hpos[a]],*Rb=&trc[b][hpos[b]]; keycmp(Ra->key,g_keylen,Rb->key,g_keylen)<0; })
     for(tt=0;tt<NT;tt++) if(hpos[tt]<bnd[tt][r+1]){ int c=hn++; hp[c]=tt;
       while(c>0){ int pp=(c-1)/2; if(RLESS(hp[c],hp[pp])){ int x=hp[c];hp[c]=hp[pp];hp[pp]=x; c=pp; } else break; } }
     rkuse[r]=0; rcnt[r]=0; rne[r]=0; int curlen=-1; long curpos=0; u128 sw=0;
-    while(hn>0){ int mt=hp[0]; Rec*R=&trc[mt][hpos[mt]]; unsigned char*rkey=tkp[mt]+R->off; int rlen=R->len;
+    while(hn>0){ int mt=hp[0]; Rec*R=&trc[mt][hpos[mt]]; unsigned char*rkey=R->key; int rlen=g_keylen;
       int same=(curlen==rlen && memcmp(rk[r]+curpos,rkey,rlen)==0);
       if(!same){ if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); rw_[r]=xrealloc(rw_[r],rgcap[r]*sizeof(u128)); } rkl[r][rcnt[r]]=curlen; rw_[r][rcnt[r]]=sw; rcnt[r]++; }
         if(rkuse[r]+rlen>rkcap[r]){ rkcap[r]=rkcap[r]*2+rlen+4096; rk[r]=xrealloc(rk[r],rkcap[r]); }
         curpos=rkuse[r]; memcpy(rk[r]+rkuse[r],rkey,rlen); rkuse[r]+=rlen; curlen=rlen; sw=0; }
-      sw=red(sw+R->w);
+      sw=red(sw+RECW(R));
       if(rec){ if(rne[r]>=recap[r]){ recap[r]=recap[r]*2+1024; re[r]=xrealloc(re[r],recap[r]*sizeof(Edge)); } re[r][rne[r]].src=(int)R->src; re[r][rne[r]].dst=(int)rcnt[r]; re[r][rne[r]].c=1; rne[r]++; }
       hpos[mt]++;
       if(hpos[mt]>=bnd[mt][r+1]) hp[0]=hp[--hn];
@@ -280,7 +285,7 @@ void sort_reduce(int s,int rec){
 #pragma omp parallel for schedule(dynamic,1)
   for(r=0;r<P;r++){ long off=kbase[r], j; memcpy(curkp+kbase[r], rk[r], rkuse[r]);
     for(j=0;j<rcnt[r];j++){ curkl[base[r]+j]=rkl[r][j]; curw[base[r]+j]=rw_[r][j]; curoff[base[r]+j]=off; off+=rkl[r][j]; } }
-  for(t=0;t<NT;t++){ tnr[t]=0; tkuse[t]=0; }
+  for(t=0;t<NT;t++){ tnr[t]=0; }
   if(rec){ int r2; static long rne2[NRNG];
     /* Coalesce each range's edges IN PLACE and globalize dst -- parallel, no
        global consolidation buffer. All edges to a given dst live in one range
