@@ -123,11 +123,30 @@ void start_mem_watcher(void){
     (cg>0&&cg<ram)?"cgroup-limited":"85% of physical",
     (cg>0&&cg<ram)?"" : ""); }
 
+@ The sweep order is the vertex numbering: cell processed at column~$c$,
+in\--column position~$p$ is vertex $v=cm+p$. |rowat[p]| is the actual board row
+at position~$p$ and |posof[]| its inverse. By default position~$=$~row
+(top\--to\--bottom). With |OUTIN| set we number positions {\it outside\--in\/}
+($0,m-1,1,m-2,\ldots$) so that after each completed symmetric pair the
+processed\--within\--column row set is closed under the reflection $r\to m-1-r$
+--- the precondition for the reflection quotient to be applied at more than just
+the column boundary.
+
+@<Globals@>=
+int rowat[64], posof[64];
+
 @ @<Subroutines@>=
-void build_board(void){ int r,c,k; V=m*n;
-  for(c=0;c<n;c++)for(r=0;r<m;r++){ int v=c*m+r; ND[v]=0;
-    for(k=0;k<8;k++){ int rr=r+KR[k],cc=c+KC[k];
-      if(rr>=0&&rr<m&&cc>=0&&cc<n) NB[v][ND[v]++]=cc*m+rr; } } }
+void build_board(void){ int c,k,p; V=m*n;
+  if(getenv("OUTIN")){ int lo=0,hi=m-1,i; for(p=0;p<m;p++){ if(p%2==0) rowat[p]=lo++; else rowat[p]=hi--; } (void)i; }
+  else { for(p=0;p<m;p++) rowat[p]=p; }
+  for(p=0;p<m;p++) posof[rowat[p]]=p;
+  { int pp,rr; for(p=0;p<m;p++){ int ok=1; static char inset[64];
+      for(rr=0;rr<m;rr++) inset[rr]=0; for(pp=0;pp<=p;pp++) inset[rowat[pp]]=1;
+      for(rr=0;rr<m;rr++) if(inset[rr] && !inset[m-1-rr]){ ok=0; break; } sym_at[p]=ok; } }
+  if(getenv("DBGROW")){ fprintf(stderr,"rowat="); for(p=0;p<m;p++) fprintf(stderr,"%d ",rowat[p]); fprintf(stderr,"  sym_at="); for(p=0;p<m;p++) fprintf(stderr,"%d",sym_at[p]); fprintf(stderr,"\n"); }
+  for(c=0;c<n;c++)for(p=0;p<m;p++){ int r0=rowat[p]; int v=c*m+p; ND[v]=0;
+    for(k=0;k<8;k++){ int rr=r0+KR[k],cc=c+KC[k];
+      if(rr>=0&&rr<m&&cc>=0&&cc<n) NB[v][ND[v]++]=cc*m+posof[rr]; } } }
 int frontier_before(int s){ int q=0,v,u,k; static char inF[64*64+2];
   for(v=0;v<=V;v++) inF[v]=0; inF[V]=1; if(s<V) inF[s]=1;
   for(v=s+1;v<V;v++) for(k=0;k<ND[v];k++){ u=NB[v][k]; if(u<s){ inF[v]=1; break; } }
@@ -309,6 +328,18 @@ static inline u128 red(u128 x){ return MODP? x%MODP : x; }
 int qnew, posS, apexnew, STEMP; int bmate[MAXF], o2n[MAXF];
 #pragma omp threadprivate(bmate,STEMP)
 @#
+/* Reflection quotient. |sym_at[p]| is 1 when, after processing the in\--column
+   position~$p$, the processed row set $\{|rowat|[0..p]\}$ is closed under the
+   board reflection $r\to m-1-r$ (so the full processed region is symmetric and
+   the reflection maps states to states). At such a cell we canonicalise each
+   emitted key to $\min(k,\hat k)$ under the frontier\--position permutation
+   |sym_sigma|; equal (also column\--shifted) reflected patterns then merge in
+   |sort_reduce|. The DP runs in orbit\--sum coordinates: each surviving state
+   carries the sum of its orbit's weights, expansion stays one\--rep\--per\--orbit,
+   and completions credit that summed weight -- so counts are unchanged while the
+   symmetric levels shrink by up to $2\times$. Valid only at symmetric cells;
+   between them the sweep is ordinary. */
+int sym_fold_on, sym_at[64], sym_bnd, sym_sigma[MAXF];
 int recording, reclev;
 typedef struct{ int src,dst; u64 c; } Edge;
 typedef struct{ int src,delta; u64 mult; } Comp;
@@ -332,6 +363,19 @@ void build_bmate(int*omate,int qold){ int i;
     if(omate[i]==-1) bmate[dst]=-1;
     else if(omate[i]>=0){ int op=omate[i]; int pdst=(op==posS)?STEMP:o2n[op]; bmate[dst]=pdst>=0?pdst:-2; } } }
 
+@ |canon_nk| replaces a just\--built key by the lexicographically smaller of it
+and its reflection (identity unless |sym_bnd| is set for this cell). It reads
+only |sym_bnd| and |sym_sigma|, fixed before the parallel expansion, so it is
+safe to call from each thread.
+
+@<Subroutines@>=
+static inline void canon_nk(unsigned char*nk,int nl){
+  if(!sym_bnd) return;
+  unsigned char rk[MAXF]; int i;
+  for(i=0;i<nl;i++){ int b=nk[i], d=sym_sigma[i];
+    rk[d] = b==0?0 : b==255?255 : (unsigned char)(1+sym_sigma[b-1]); }
+  if(memcmp(rk,nk,nl)<0) memcpy(nk,rk,nl); }
+
 @ @<Subroutines@>=
 void run_step(int s,int rec){
   int i; long si; long in_ncur=ncur; int qold=frontier_before(s); posS=ifrb[s];
@@ -339,6 +383,10 @@ void run_step(int s,int rec){
   qnew=frontier_before(s+1); static int ifrnew[64*64+2], frnew[MAXF];
   for(i=0;i<qnew;i++) frnew[i]=fr[i]; for(i=0;i<=V;i++) ifrnew[i]=-1; for(i=0;i<qnew;i++) ifrnew[frnew[i]]=i;
   apexnew=ifrnew[V];
+  sym_bnd = sym_fold_on && sym_at[s%m];
+  if(sym_bnd){ for(i=0;i<qnew;i++){ int v=frnew[i], rv;
+      if(v==V) rv=V; else { int col=v/m, pp=v%m; rv=col*m + posof[m-1-rowat[pp]]; }
+      sym_sigma[i]=ifrnew[rv]; } }
   int nbr[16],rr=0; nbr[rr++]=apexnew;
   for(i=0;i<ND[s];i++){ int w=NB[s][i]; if(w>s && ifrnew[w]>=0) nbr[rr++]=ifrnew[w]; }
   for(i=0;i<qold;i++) o2n[i]=(frold[i]==s)?-1:ifrnew[frold[i]];
@@ -359,13 +407,13 @@ for(si=0;si<ncur;si++){
   int omate[MAXF]; unsigned char nk[MAXF];
   for(i=0;i<okl;i++){int cc=ok[i]; omate[i]= cc==0?-2 : cc==255?-1 : cc-1;}
   deg=omate[posS]==-2?0:omate[posS]==-1?2:1; need=2-deg;
-  if(need==0){ build_bmate(omate,qold); for(i=0;i<qnew;i++) mate[i]=bmate[i]; nl=keyof(qnew,nk); emit(nk,nl,w,si); }
+  if(need==0){ build_bmate(omate,qold); for(i=0;i<qnew;i++) mate[i]=bmate[i]; nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,w,si); }
   else if(need==1){ for(a=0;a<rr;a++){ build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
-    if(add_derived(STEMP,nbr[a])){ nl=keyof(qnew,nk); emit(nk,nl,w,si); }
+    if(add_derived(STEMP,nbr[a])){ nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,w,si); }
     else if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } } }
   else { for(a=0;a<rr;a++)for(b=a+1;b<rr;b++){ build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
     if(!add_derived(STEMP,nbr[a])){ if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } continue; }
-    if(add_derived(STEMP,nbr[b])){ nl=keyof(qnew,nk); emit(nk,nl,w,si); }
+    if(add_derived(STEMP,nbr[b])){ nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,w,si); }
     else if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } } }
 }
 
@@ -469,12 +517,19 @@ void seed_bucket(void){ int i; int q=frontier_before(0);
 u64 cnt2[1<<16];
 int run_periodic(int mm,int Wb,int Next){
   int i,s,c; m=mm; n=Wb; build_board(); memset(cnt2,0,sizeof(cnt2));
+  sym_fold_on = getenv("SYMFOLD")?1:0;
+  if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
   recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
   int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
   int cand_p=0,cand_c=-1;   /* pending (unconfirmed) period candidate */
   for(s=(resume_from>0?resume_from:0);s<V;s++){
     if(recording && s==recstart){ seedn=ncur; seedv=xmalloc(ncur*sizeof(u128)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0;
+      if(getenv("SYMDUMP")){  /* dump frontier layout + all state keys, for the reflection-symmetry study */
+        int q=frontier_before(recstart); FILE*sp=fopen(getenv("SYMDUMP"),"wb");
+        fwrite(&m,sizeof(int),1,sp); fwrite(&V,sizeof(int),1,sp); fwrite(&q,sizeof(int),1,sp); fwrite(fr,sizeof(int),q,sp);
+        fwrite(&ncur,sizeof(long),1,sp); { long i2; for(i2=0;i2<ncur;i2++){ fwrite(&curkl[i2],sizeof(int),1,sp); fwrite(curkp+curoff[i2],1,curkl[i2],sp); } }
+        fclose(sp); fprintf(stderr,"symdump: m=%d V=%d q=%d ncur=%ld -> %s\n",m,V,q,ncur,getenv("SYMDUMP")); }
       if(stream_edges){  /* write the table's fixed prefix now; levels stream in after; patch at dump */
         rec_fp=fopen(rec_path,"wb"); if(!rec_fp){ fprintf(stderr,"cannot open %s\n",rec_path); exit(3); }
         int hdr[6]={m,period_g,c0_g,Plevs,recend_col_g,0};   /* direct_valid_col_g patched at dump */
