@@ -32,6 +32,11 @@ Status legend: ⬜ todo · 🔬 experimenting · ✅ done/adopted · ❌ tried, 
   BFS yields the bulk stable set + periodic block; the transient (cols 0..R) still uses the
   short sweep, then junction+replay as now.
 
+  **Ceiling measured (MEMOSTAT):** re-expansion factor = total expansions / distinct
+  (substep,state) = **4.47× (m5), 7.32× (m6)** and growing with m. Pure BFS drops BOTH
+  expand AND the 43% sort by this factor (distinct states deduped, not all successors).
+  So parallel A1 ceiling ≈ build **~7×** (m6). Confirms it's worth the parallel rewrite.
+
   **Plan:** (1) serial BFS closure prototype → validate it reproduces the periodic block /
   OEIS on m=5/6 (correctness of "each state once = correct transfer"); (2) shard it for
   parallelism; (3) integrate with transient + junction.

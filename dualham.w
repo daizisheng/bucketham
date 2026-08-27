@@ -464,6 +464,7 @@ int exact_capture;   /* the replay fills cnt2 but prints nothing (residues read 
 static double nowsec(void);
 double t_expand, t_reduce, t_compress;   /* build-phase timers (seconds) */
 long del_total, del_total2;   /* DELCHECK: states that vanished vs same-phase prev col (period 1 / period 2) */
+long memo_total; unsigned char* memo_buf[64]; long memo_bn[64], memo_cap[64]; int memo_kl[64];   /* MEMOSTAT: re-expansion factor */
 /* Aggressive recording: record only cols 0..aggr_R (the left-boundary transient)
    plus the periodic block, SKIPPING the middle cols R+1..c0. Every column's state
    set is a subset of the stable set (verified), and the transfer is bulk from a
@@ -648,6 +649,7 @@ int run_periodic(int mm,int Wb,int Next){
   if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
   wfree = 1; Ltot_g=0;   /* weight-free replay is the only build mode now */
   t_expand=t_reduce=t_compress=0; del_total=del_total2=0;
+  if(getenv("MEMOSTAT")){ memo_total=0; int ss; for(ss=0;ss<64;ss++) memo_bn[ss]=0; }
   hashagg = getenv("HASHAGG")?1:0;
   aggr_R = getenv("AGGR")? atoi(getenv("AGGR")) : -1;   /* aggressive: record only cols 0..AGGR + periodic block */
   if(hashagg && stream_edges){ fprintf(stderr,"HASHAGG is in-process only for now\n"); exit(4); }
@@ -700,6 +702,11 @@ int run_periodic(int mm,int Wb,int Next){
     if(s%m==m-1 && getenv("DBG")) fprintf(stderr,"  col %d ncur=%ld rec=%d\n",s/m,ncur,recording);
     if(!recording && s%m==m-1 && (s/m)%ckpt_every==0) save_ckpt(s+1);
     if(recording && s==seam_break && stop_after_record) break;
+    if(getenv("MEMOSTAT")){  /* A1 ceiling: total expansions vs DISTINCT (substep,state); ratio = re-expansion factor */
+      int ss=s%m; long i2; memo_total += ncur;
+      for(i2=0;i2<ncur;i2++){ int kl=curkl[i2]; if(memo_bn[ss]+kl>memo_cap[ss]){ memo_cap[ss]=memo_cap[ss]*2+kl+(1<<20); memo_buf[ss]=xrealloc(memo_buf[ss],memo_cap[ss]); }
+        memcpy(memo_buf[ss]+memo_bn[ss], curkp+curoff[i2], kl); memo_bn[ss]+=kl; }
+      memo_kl[ss]=curkl[0]; }
     if(getenv("DELCHECK")){  /* deletions vs SAME-PHASE previous column: s-m (period 1) and s-2m (period 2) */
       static unsigned char* cb[96]; static long cc[96]; static int ck[96]; int W=2*m+2, sl=s%W;
       long tot=0,i2; for(i2=0;i2<ncur;i2++) tot+=curkl[i2];
@@ -714,6 +721,11 @@ int run_periodic(int mm,int Wb,int Next){
     if(wfree && recording && recend>=0 && s>=recend) break;  /* wfree: nothing to sweep past the recorded block */
   }
   @<Finalize direct coverage and verify periodicity@>@;
+  if(getenv("MEMOSTAT")){ long dist=0; int ss; for(ss=0;ss<m;ss++){ if(!memo_bn[ss])continue; int kl=memo_kl[ss]; long n=memo_bn[ss]/kl,i3;
+      long* idx=xmalloc(n*sizeof(long)); for(i3=0;i3<n;i3++) idx[i3]=i3; ha_sb=memo_buf[ss]; ha_sl=kl; qsort(idx,n,sizeof(long),ha_idxcmp);
+      long d=n?1:0; for(i3=1;i3<n;i3++) if(memcmp(memo_buf[ss]+idx[i3]*kl, memo_buf[ss]+idx[i3-1]*kl, kl)!=0) d++; dist+=d; free(idx); }
+    fprintf(stderr,"MEMOSTAT: total expansions=%ld, distinct (substep,state)=%ld  => re-expansion factor %.2fx (A1 ceiling)\n",
+      memo_total,dist, dist?(double)memo_total/dist:0.0); }
   if(getenv("DELCHECK")) fprintf(stderr,"DELCHECK: deletions vs prev col -- period1 (s-m)=%ld, period2 (s-2m)=%ld => %s\n",
     del_total, del_total2, (del_total==0||del_total2==0)?"MONOTONE at the true period (each state expandable once)":"deletions at both periods");
   direct_cov_g = stop_after_record ? direct_valid_col_g : n;
