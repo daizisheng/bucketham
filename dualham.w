@@ -194,8 +194,11 @@ carries the emitting state's index, used only while recording the edge tables.
    the same key length |g_keylen| (=|qnew|), so no per-record |len| is stored.
    Net: 48 bytes + a 13-byte pooled key -> 40 bytes self-contained. */
 #define KEYMAX 20
-typedef struct { u64 wlo,whi; int src; unsigned char key[KEYMAX]; } Rec;
-#define RECW(R) (((u128)(R)->whi<<64)|(R)->wlo)
+/* Weight-free: the record carries only its emitting state's index (for the edge
+   table) and its key. No weight -- the build extracts the edge/completion
+   structure only, and the SpMV replay from col 0 regenerates every weight.
+   24 bytes, and the state set drops its weight column too. */
+typedef struct { int src; unsigned char key[KEYMAX]; } Rec;
 
 @ @<Globals@>=
 long kuse;   /* vestigial: still written to the checkpoint stream (always 0) */
@@ -205,11 +208,10 @@ Rec* trc[NTMAX]; long tnr[NTMAX], trcap[NTMAX];
 int g_keylen;   /* key length (=qnew) for the level currently being reduced */
 
 @ @<Subroutines@>=
-void emit(unsigned char*key,int len,u128 w,long src){
+void emit(unsigned char*key,int len,long src){
   int t=omp_get_thread_num();
   if(tnr[t]>=trcap[t]){trcap[t]=trcap[t]*2+65536;trc[t]=xrealloc(trc[t],trcap[t]*sizeof(Rec));}
-  Rec*R=&trc[t][tnr[t]++]; R->wlo=(u64)w; R->whi=(u64)(w>>64); R->src=(int)src;
-  memcpy(R->key,key,len); }
+  Rec*R=&trc[t][tnr[t]++]; R->src=(int)src; memcpy(R->key,key,len); }
 @#
 int rcmp_r(const void*A,const void*B,void*arg){ (void)arg; const Rec*a=A,*b=B;
   return memcmp(a->key,b->key,g_keylen); }
@@ -229,7 +231,7 @@ int keycmp(unsigned char*a,int la,unsigned char*b,int lb){ int l=la<lb?la:lb; in
 typedef struct{ unsigned char* k; int len; } Samp;
 int sampcmp(const void*A,const void*B){ const Samp*a=A,*b=B; return keycmp(a->k,a->len,b->k,b->len); }
 static unsigned char* rk[NRNG]; static long rkcap[NRNG], rkuse[NRNG];
-static int* rkl[NRNG]; static u128* rw_[NRNG]; static long rcnt[NRNG], rgcap[NRNG];
+static int* rkl[NRNG]; static long rcnt[NRNG], rgcap[NRNG];
 static Edge* re[NRNG]; static long rne[NRNG], recap[NRNG];
 static long bnd[NTMAX][NRNG+1];
 void sort_reduce(int s,int rec){
@@ -242,7 +244,7 @@ void sort_reduce(int s,int rec){
   if(getenv("BUILDMEM")){
     fprintf(stderr,"  [mem s=%d] emit recs=%ld (%.2fGB Rec, inline key len %d) ; state ncur=%ld (%.2fGB)\n",
       s, tot, tot*(double)sizeof(Rec)/1073741824.0, g_keylen, ncur,
-      ncur*(double)(sizeof(long)+sizeof(int)+sizeof(u128))/1073741824.0); }
+      ncur*(double)(sizeof(long)+sizeof(int))/1073741824.0); }
   int P=NT*8; if(P>NRNG) P=NRNG; if(P<1) P=1; if((long)P>tot && tot>0) P=(int)tot;
   int S=P*8; if((long)S>tot) S=(int)tot;
   static Samp* samp=0; static long sampcap=0; if(sampcap<S+1){ sampcap=S+1; samp=xrealloc(samp,sampcap*sizeof(Samp)); }
@@ -262,29 +264,27 @@ void sort_reduce(int s,int rec){
 #define RLESS(a,b) ({ Rec*Ra=&trc[a][hpos[a]],*Rb=&trc[b][hpos[b]]; keycmp(Ra->key,g_keylen,Rb->key,g_keylen)<0; })
     for(tt=0;tt<NT;tt++) if(hpos[tt]<bnd[tt][r+1]){ int c=hn++; hp[c]=tt;
       while(c>0){ int pp=(c-1)/2; if(RLESS(hp[c],hp[pp])){ int x=hp[c];hp[c]=hp[pp];hp[pp]=x; c=pp; } else break; } }
-    rkuse[r]=0; rcnt[r]=0; rne[r]=0; int curlen=-1; long curpos=0; u128 sw=0;
+    rkuse[r]=0; rcnt[r]=0; rne[r]=0; int curlen=-1; long curpos=0;
     while(hn>0){ int mt=hp[0]; Rec*R=&trc[mt][hpos[mt]]; unsigned char*rkey=R->key; int rlen=g_keylen;
       int same=(curlen==rlen && memcmp(rk[r]+curpos,rkey,rlen)==0);
-      if(!same){ if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); rw_[r]=xrealloc(rw_[r],rgcap[r]*sizeof(u128)); } rkl[r][rcnt[r]]=curlen; rw_[r][rcnt[r]]=sw; rcnt[r]++; }
+      if(!same){ if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); } rkl[r][rcnt[r]]=curlen; rcnt[r]++; }
         if(rkuse[r]+rlen>rkcap[r]){ rkcap[r]=rkcap[r]*2+rlen+4096; rk[r]=xrealloc(rk[r],rkcap[r]); }
-        curpos=rkuse[r]; memcpy(rk[r]+rkuse[r],rkey,rlen); rkuse[r]+=rlen; curlen=rlen; sw=0; }
-      sw=red(sw+RECW(R));
+        curpos=rkuse[r]; memcpy(rk[r]+rkuse[r],rkey,rlen); rkuse[r]+=rlen; curlen=rlen; }
       if(rec){ if(rne[r]>=recap[r]){ recap[r]=recap[r]*2+1024; re[r]=xrealloc(re[r],recap[r]*sizeof(Edge)); } re[r][rne[r]].src=(int)R->src; re[r][rne[r]].dst=(int)rcnt[r]; re[r][rne[r]].c=1; rne[r]++; }
       hpos[mt]++;
       if(hpos[mt]>=bnd[mt][r+1]) hp[0]=hp[--hn];
       { int c=0; while(1){ int l=2*c+1,r2=2*c+2,sm=c; if(l<hn&&RLESS(hp[l],hp[sm]))sm=l; if(r2<hn&&RLESS(hp[r2],hp[sm]))sm=r2; if(sm==c)break; int x=hp[c];hp[c]=hp[sm];hp[sm]=x; c=sm; } }
     }
-    if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); rw_[r]=xrealloc(rw_[r],rgcap[r]*sizeof(u128)); } rkl[r][rcnt[r]]=curlen; rw_[r][rcnt[r]]=sw; rcnt[r]++; }
+    if(curlen>=0){ if(rcnt[r]>=rgcap[r]){ rgcap[r]=rgcap[r]*2+1024; rkl[r]=xrealloc(rkl[r],rgcap[r]*sizeof(int)); } rkl[r][rcnt[r]]=curlen; rcnt[r]++; }
   }
   static long base[NRNG+1], kbase[NRNG+1], ebase[NRNG+1];
   base[0]=kbase[0]=ebase[0]=0;
   for(r=0;r<P;r++){ base[r+1]=base[r]+rcnt[r]; kbase[r+1]=kbase[r]+rkuse[r]; ebase[r+1]=ebase[r]+rne[r]; }
   ncur=base[P];
-  curoff=xrealloc(curoff,(ncur+1)*sizeof(long)); curkl=xrealloc(curkl,(ncur+1)*sizeof(int));
-  curw=xrealloc(curw,(ncur+1)*sizeof(u128)); curkp=xrealloc(curkp,kbase[P]+1);
+  curoff=xrealloc(curoff,(ncur+1)*sizeof(long)); curkl=xrealloc(curkl,(ncur+1)*sizeof(int)); curkp=xrealloc(curkp,kbase[P]+1);
 #pragma omp parallel for schedule(dynamic,1)
   for(r=0;r<P;r++){ long off=kbase[r], j; memcpy(curkp+kbase[r], rk[r], rkuse[r]);
-    for(j=0;j<rcnt[r];j++){ curkl[base[r]+j]=rkl[r][j]; curw[base[r]+j]=rw_[r][j]; curoff[base[r]+j]=off; off+=rkl[r][j]; } }
+    for(j=0;j<rcnt[r];j++){ curkl[base[r]+j]=rkl[r][j]; curoff[base[r]+j]=off; off+=rkl[r][j]; } }
   for(t=0;t<NT;t++){ tnr[t]=0; }
   if(rec){ int r2; static long rne2[NRNG];
     /* Coalesce each range's edges IN PLACE and globalize dst -- parallel, no
@@ -326,7 +326,7 @@ degree~2 by adding its $2-\deg(s)$ edges to future neighbours or the apex. When
 and the completion contributions for this level.
 
 @<Globals@>=
-unsigned char*curkp; long*curoff; int*curkl; u128*curw; long ncur;
+unsigned char*curkp; long*curoff; int*curkl; long ncur;
 u128 cnt[1<<16];
 u64 MODP=0;   /* 0 = exact u64; set to a prime for one CRT residue */
 static inline u128 red(u128 x){ return MODP? x%MODP : x; }
@@ -411,25 +411,24 @@ thread emits into its own pool; |cnt| is updated in a critical section.
 @<Expand every state at cell |s|@>=
 #pragma omp parallel for schedule(dynamic,32)
 for(si=0;si<ncur;si++){
-  int i,a,b,nl,deg,need,mp; unsigned char*ok=curkp+curoff[si]; int okl=curkl[si]; u128 w=curw[si];
+  int i,a,b,nl,deg,need,mp; unsigned char*ok=curkp+curoff[si]; int okl=curkl[si];
   int omate[MAXF]; unsigned char nk[MAXF];
   for(i=0;i<okl;i++){int cc=ok[i]; omate[i]= cc==0?-2 : cc==255?-1 : cc-1;}
   deg=omate[posS]==-2?0:omate[posS]==-1?2:1; need=2-deg;
-  if(need==0){ build_bmate(omate,qold); for(i=0;i<qnew;i++) mate[i]=bmate[i]; nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,w,si); }
+  if(need==0){ build_bmate(omate,qold); for(i=0;i<qnew;i++) mate[i]=bmate[i]; nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,si); }
   else if(need==1){ for(a=0;a<rr;a++){ build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
-    if(add_derived(STEMP,nbr[a])){ nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,w,si); }
+    if(add_derived(STEMP,nbr[a])){ nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,si); }
     else if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } } }
   else { for(a=0;a<rr;a++)for(b=a+1;b<rr;b++){ build_bmate(omate,qold); for(i=0;i<=qnew;i++) mate[i]=bmate[i];
     if(!add_derived(STEMP,nbr[a])){ if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } continue; }
-    if(add_derived(STEMP,nbr[b])){ nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,w,si); }
+    if(add_derived(STEMP,nbr[b])){ nl=keyof(qnew,nk); canon_nk(nk,nl); emit(nk,nl,si); }
     else if(cycle){ mp=completion_mp(qnew,apexnew,frnew,s); if(mp) @<Credit completion@>; } } }
 }
 
 @ @<Credit completion@>=
 {
 #pragma omp critical
-  { cnt[mp]=red(cnt[mp]+w);
-    if(rec){ if(reccomp_n>=reccomp_cap){ reccomp_cap=reccomp_cap*2+(1<<20); reccomp_buf=xrealloc(reccomp_buf,reccomp_cap*sizeof(Comp)); }
+  { if(rec){ if(reccomp_n>=reccomp_cap){ reccomp_cap=reccomp_cap*2+(1<<20); reccomp_buf=xrealloc(reccomp_buf,reccomp_cap*sizeof(Comp)); }
       reccomp_buf[reccomp_n].src=si; reccomp_buf[reccomp_n].delta=mp-(s+1); reccomp_buf[reccomp_n].mult=1; reccomp_n++; } }
 }
 
@@ -453,15 +452,15 @@ void save_ckpt(int nexts){ if(!ckpt_path) return; FILE*f=fopen(ckpt_path,"wb");
   fwrite(cnt,sizeof(u128),1<<16,f); fwrite(colfp_g,sizeof(u64),4096,f);
   fwrite(&ncur,sizeof(long),1,f); fwrite(&kuse,sizeof(long),1,f);
   fwrite(curoff,sizeof(long),ncur,f); fwrite(curkl,sizeof(int),ncur,f);
-  fwrite(curw,sizeof(u128),ncur,f);
+  /* weight-free: no state weights to checkpoint */
   { long kb=0,i; for(i=0;i<ncur;i++) kb+=curkl[i]; fwrite(&kb,sizeof(long),1,f); fwrite(curkp,1,kb,f); }
   fclose(f); }
 int load_ckpt(const char*path){ FILE*f=fopen(path,"rb"); if(!f) return -1; int nexts,mm;
   if(fread(&mm,sizeof(int),1,f)!=1) return -1; m=mm; fread(&nexts,sizeof(int),1,f);
   fread(cnt,sizeof(u128),1<<16,f); fread(colfp_g,sizeof(u64),4096,f);
   fread(&ncur,sizeof(long),1,f); fread(&kuse,sizeof(long),1,f);
-  curoff=xrealloc(curoff,(ncur+1)*sizeof(long)); curkl=xrealloc(curkl,(ncur+1)*sizeof(int)); curw=xrealloc(curw,(ncur+1)*sizeof(u64));
-  fread(curoff,sizeof(long),ncur,f); fread(curkl,sizeof(int),ncur,f); fread(curw,sizeof(u128),ncur,f);
+  curoff=xrealloc(curoff,(ncur+1)*sizeof(long)); curkl=xrealloc(curkl,(ncur+1)*sizeof(int));
+  fread(curoff,sizeof(long),ncur,f); fread(curkl,sizeof(int),ncur,f);
   { long kb; fread(&kb,sizeof(long),1,f); curkp=xrealloc(curkp,kb+1); fread(curkp,1,kb,f); }
   fclose(f); fprintf(stderr,"resumed build from %s at cell %d (col %d)\n",path,nexts,nexts/mm); return nexts; }
 
@@ -519,22 +518,22 @@ covers ($c\ge c_0+3$), and the SpMV alone yields the columns past~$W_b$.
 int resume_from=0;
 void seed_bucket(void){ int i; int q=frontier_before(0);
   for(i=0;i<q;i++) mate[i]=-2; unsigned char key[MAXF]; int kl=keyof(q,key);
-  curkp=xmalloc(1<<20); curoff=xmalloc(sizeof(long)); curkl=xmalloc(sizeof(int)); curw=xmalloc(sizeof(u64));
-  memcpy(curkp,key,kl); curoff[0]=0; curkl[0]=kl; curw[0]=1; ncur=1; }
+  curkp=xmalloc(1<<20); curoff=xmalloc(sizeof(long)); curkl=xmalloc(sizeof(int));
+  memcpy(curkp,key,kl); curoff[0]=0; curkl[0]=kl; ncur=1; }
 @#
 u64 cnt2[1<<16];
 int run_periodic(int mm,int Wb,int Next){
   int i,s,c; m=mm; n=Wb; build_board(); memset(cnt2,0,sizeof(cnt2));
   sym_fold_on = getenv("SYMFOLD")?1:0;
   if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
-  wfree = getenv("WFREE")?1:0; Ltot_g=0;
+  wfree = 1; Ltot_g=0;   /* weight-free replay is the only build mode now */
   recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
   int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
   int cand_p=0,cand_c=-1;   /* pending (unconfirmed) period candidate */
   if(wfree){ recording=1; recstart=0; recend=V; }  /* record every level from col 0; recend widened until the period is confirmed */
   for(s=(resume_from>0?resume_from:0);s<V;s++){
-    if(recording && s==recstart){ seedn=ncur; seedv=xmalloc(ncur*sizeof(u128)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0;
+    if(recording && s==recstart){ seedn=ncur; nstate[0]=ncur; reclev=0;  /* weight-free: no seed vector; start replay from [1] */
       if(getenv("SYMDUMP")){  /* dump frontier layout + all state keys, for the reflection-symmetry study */
         int q=frontier_before(recstart); FILE*sp=fopen(getenv("SYMDUMP"),"wb");
         fwrite(&m,sizeof(int),1,sp); fwrite(&V,sizeof(int),1,sp); fwrite(&q,sizeof(int),1,sp); fwrite(fr,sizeof(int),q,sp);
@@ -627,12 +626,9 @@ int build_extract(int mm,int Wb){ return run_periodic(mm,Wb,Wb); }
 void spmv_run(int Nto,int crosscheck){
   int i; memset(cnt2,0,sizeof(cnt2));
   @<Iterate the SpMV out to column $N$@>;
-  if(wfree){  /* validation: the replay (cnt2, from col 0) must match the direct sweep (cnt) everywhere direct is exact */
-    int good=1,cc;
-    for(cc=1;cc<=Nto && cc<=direct_cov_g;cc++) if((u64)red(cnt[cc*m])!=cnt2[cc*m]){ good=0;
-      fprintf(stderr,"WFREE MISMATCH c=%d direct=%llu replay=%llu\n",cc,(unsigned long long)(u64)red(cnt[cc*m]),(unsigned long long)cnt2[cc*m]); }
-    for(cc=1;cc<=Nto;cc++){ u64 val=cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>direct_cov_g?"  (replay)":"  (replay=direct)"); }
-    fprintf(stderr,"%s\n", good?"WFREE replay matches direct":"WFREE replay MISMATCH"); return; }
+  { int cc;  /* weight-free: every column comes from the replay */
+    for(cc=1;cc<=Nto;cc++){ u64 val=cnt2[cc*m]; if(val) printf("open %dx%d = %llu\n",m,cc,val); }
+    return; }
   { int good=1,cc;
     if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=direct_cov_g;cc++) if((u64)cnt[cc*m]!=cnt2[cc*m]){ good=0;
       fprintf(stderr,"MISMATCH c=%d direct=%llu spmv=%llu\n",cc,(unsigned long long)(u64)cnt[cc*m],(unsigned long long)cnt2[cc*m]); }
@@ -880,8 +876,8 @@ int main(int argc,char*argv[]){
      and m=7 values (4xc=cx4) without their million-state sweeps; one m=5 strip,
      built wide enough to record, exercises both the direct and the SpMV paths. */
   struct{int m,Wb,Next,c;u64 e;} chk[]={
-    {4,9,9,6,744ULL},                       /* 4x6 = 6x4 */
-    {4,9,9,7,6378ULL},                      /* 4x7 = 7x4 */
+    {4,12,9,6,744ULL},                      /* 4x6 = 6x4 */
+    {4,12,9,7,6378ULL},                     /* 4x7 = 7x4 */
     {5,18,22,8,18061054ULL},                /* m=5, direct column */
     {5,18,22,12,3611823644006ULL},          /* m=5, direct seam column (recend+1) */
     {5,18,22,15,24535910156176100ULL},      /* m=5, SpMV extrapolation (past recend+1) */
@@ -890,7 +886,7 @@ int main(int argc,char*argv[]){
   for(i=0;chk[i].m;i++){
     if(chk[i].m!=lm||chk[i].Wb!=lw||chk[i].Next!=ln){
       run_periodic(chk[i].m,chk[i].Wb,chk[i].Next); lm=chk[i].m; lw=chk[i].Wb; ln=chk[i].Next; }
-    int c=chk[i].c; u64 g=(c<=direct_valid_col_g? cnt[c*m] : cnt2[c*m]), e=red(chk[i].e);
+    int c=chk[i].c; u64 g=cnt2[c*m], e=red(chk[i].e);   /* weight-free: all counts come from the replay */
     printf("open %dx%d = %llu  exp %llu  %s\n",chk[i].m,c,g,e,g==e?"OK":"FAIL");
     if(g!=e) bad++; }
   printf("%s\n",bad?"SOME FAILED":"ALL OK"); return bad?1:0;
