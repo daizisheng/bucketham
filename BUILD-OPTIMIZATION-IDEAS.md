@@ -44,14 +44,6 @@ Status legend: ⬜ todo · 🔬 experimenting · ✅ done/adopted · ❌ tried, 
   Memoization cache ≈ the periodic block (already stored under aggressive) → not much extra
   memory for m=7 (~fits 128GB); for m=8 the cache is ~the full transfer (big) — A1 mainly a
   build-SPEED lever, less an m=8-memory one.
-  Build the transfer matrix by BFS from the seed: expand each *reachable* state ONCE,
-  store its successor edges in a growing edge table (hash state→id + edges), follow to
-  new states until closure. The sweep currently re-expands the accumulated set every
-  column (~5–8×, since Sₖ₋₁ ⊆ Sₖ). BFS expands each reachable state exactly once.
-  - Payoff: expand ~5–8× → **build ~2–3×**; also removes the sort/dedup (states are
-    discovered distinct). Cost: holds the edge table in RAM → **+memory** (pair with B1).
-  - The state graph is layered by substep mod m (periodic); BFS fills each (phase,state)
-    once. The edge table IS the saved transfer matrix — replay runs on it directly.
 
 - **A2. Direct enumeration of the state universe** 💤 (calibrated; A1 is strictly better)
   Idea was to enumerate the frontier-state universe and compute edges directly, no sweep.
