@@ -363,6 +363,11 @@ void sort_reduce(int s,int rec){
           long prev_src=0,k; for(k=e2;k<j;k++){ olen+=vput(ob+olen,(u64)(re[r2][k].src-prev_src)); prev_src=re[r2][k].src; olen+=vput(ob+olen,re[r2][k].c); }
           prev_dst=dst; e2=j; } }
       cedge[reclev]=ob; ced_len[reclev]=tot; edges[reclev]=0;
+      /* the ranges are the parallel-decode split points: each starts at byte roff[r2]
+         with running dst rpd[r2] and holds complete dst-groups (disjoint dst blocks),
+         so a decoder can start there and its writes never collide with another range's. */
+      { int sn=0,r3; csoff[reclev]=xrealloc(csoff[reclev],(P+1)*sizeof(long)); csdst[reclev]=xrealloc(csdst[reclev],(P+1)*sizeof(long));
+        for(r3=0;r3<P;r3++) if(rne2[r3]>0){ csoff[reclev][sn]=roff[r3]; csdst[reclev][sn]=rpd[r3]; sn++; } csn[reclev]=sn; }
       comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
     }
     reclev++; }
@@ -392,9 +397,12 @@ void hashagg_finalize(int rec){
        Buffer grows from ~8B/edge; the compressed edges then live in RAM at
        ~6B/edge instead of 16B. */
     long cap=ha_ea_n*8+4096; unsigned char* ob=xmalloc(cap); long olen=0, prev_dst=-1, pp=0;
+    long SPLIT=1L<<21, since=SPLIT, sn=0, scap=ha_ea_n/SPLIT+4;   /* split points every ~SPLIT edges for parallel decode */
+    csoff[reclev]=xrealloc(csoff[reclev],scap*sizeof(long)); csdst[reclev]=xrealloc(csdst[reclev],scap*sizeof(long));
     while(pp<ha_ea_n){
       if(olen+64>cap){ cap=cap*2; ob=xrealloc(ob,cap); }
-      u32 dd=(u32)(ha_ea[pp]>>32); long j=pp; while(j<ha_ea_n && (u32)(ha_ea[j]>>32)==dd) j++;
+      if(since>=SPLIT){ csoff[reclev][sn]=olen; csdst[reclev][sn]=prev_dst; sn++; since=0; }
+      u32 dd=(u32)(ha_ea[pp]>>32); long j=pp; while(j<ha_ea_n && (u32)(ha_ea[j]>>32)==dd) j++; since+=j-pp;
       long gsize=0,k=pp; while(k<j){ u32 s=(u32)ha_ea[k]; long q=k; while(q<j&&(u32)ha_ea[q]==s)q++; gsize++; k=q; }
       olen+=vput(ob+olen,(u64)((long)dd-prev_dst)); olen+=vput(ob+olen,(u64)gsize);
       long prev_src=0; k=pp;
@@ -402,7 +410,7 @@ void hashagg_finalize(int rec){
         olen+=vput(ob+olen,(u64)((long)s-prev_src)); prev_src=s; olen+=vput(ob+olen,c); o++; k=q; }
       prev_dst=dd; pp=j;
     }
-    cedge[reclev]=ob; ced_len[reclev]=olen; edges[reclev]=0; nedge[reclev]=o;
+    cedge[reclev]=ob; ced_len[reclev]=olen; edges[reclev]=0; nedge[reclev]=o; csn[reclev]=(int)sn;
     nstate[reclev]=in_ncur_g; nstate[reclev+1]=ncur; ncomp[reclev]=reccomp_n;
     comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
     reclev++;
@@ -636,7 +644,8 @@ int run_periodic(int mm,int Wb,int Next){
   hashagg = getenv("HASHAGG")?1:0;
   aggr_R = getenv("AGGR")? atoi(getenv("AGGR")) : -1;   /* aggressive: record only cols 0..AGGR + periodic block */
   if(hashagg && stream_edges){ fprintf(stderr,"HASHAGG is in-process only for now\n"); exit(4); }
-  { int L; for(L=0;L<MAXLEV;L++){ if(cedge[L]){free(cedge[L]);cedge[L]=0;} edges[L]=0; ced_len[L]=0; nedge[L]=0; } }  /* fresh run: clear per-level edge stores */
+  { int L; for(L=0;L<MAXLEV;L++){ if(cedge[L]){free(cedge[L]);cedge[L]=0;} edges[L]=0; ced_len[L]=0; nedge[L]=0;
+      if(csoff[L]){free(csoff[L]);csoff[L]=0;} if(csdst[L]){free(csdst[L]);csdst[L]=0;} csn[L]=0; } }  /* fresh run: clear per-level edge stores + split points */
   recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
   int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
@@ -1029,14 +1038,25 @@ void wfree_replay_batch(int Nto,u64*pr,int B,u32*out,size_t vcols){
   memset(out,0,vcols*B*sizeof(u32));
   u32* cnt2b_g=out;
   u32* v=xcalloc((size_t)nstate[0]*B,sizeof(u32)); for(b=0;b<B;b++) v[b]=1;
+/* Parallel decode of one level: the split points |csoff|/|csdst| cut the byte
+   stream at dst-group boundaries into disjoint dst blocks, so each thread decodes
+   its span and scatters into |vn_| with no collisions (window + prefetch + Barrett). */
 #define APPLYB(LL,ACOL,SUB) do{ int L_=(LL),abscol_=(ACOL),substep_=(SUB); long e_; \
     for(e_=0;e_<ncomp[L_];e_++){ size_t idx_=(size_t)(abscol_*m+substep_+1+comps[L_][e_].delta)*B; long sc_=comps[L_][e_].src; u64 mult_=comps[L_][e_].mult; \
       for(b=0;b<B;b++){ cnt2b_g[idx_+b]=barr((u64)cnt2b_g[idx_+b]+(u64)v[(size_t)sc_*B+b]*mult_,pr[b],mu[b]); } } \
     u32* vn_=xcalloc((size_t)nstate[L_+1]*B,sizeof(u32)); \
-    unsigned char* p_=cedge[L_], *end_=p_+ced_len[L_]; long dst_=-1; \
-    while(p_<end_){ dst_+=(long)vget(&p_); long gs_=(long)vget(&p_),g_,src_=0; \
-      for(g_=0;g_<gs_;g_++){ src_+=(long)vget(&p_); u64 c_=vget(&p_); size_t di=(size_t)dst_*B, si=(size_t)src_*B; \
-        for(b=0;b<B;b++){ vn_[di+b]=barr((u64)vn_[di+b]+(u64)v[si+b]*c_,pr[b],mu[b]); } } } \
+    int NT_=omp_get_max_threads(), tt_, SN_=csn[L_]; \
+    _Pragma("omp parallel for schedule(dynamic,1)") \
+    for(tt_=0;tt_<NT_;tt_++){ int s0_=(int)((long)tt_*SN_/NT_), s1_=(int)((long)(tt_+1)*SN_/NT_); if(s1_>SN_)s1_=SN_; \
+      if(s0_<s1_){ unsigned char* p_=cedge[L_]+csoff[L_][s0_], *end_=cedge[L_]+(s1_<SN_?csoff[L_][s1_]:ced_len[L_]); \
+        long prev_=csdst[L_][s0_], cur_=-1; u64 acc_[64]; int bb_,w_; long Wd_[640],Ws_[640]; u32 Wc_[640]; \
+        while(p_<end_){ int nw_=0; \
+          while(p_<end_ && nw_<512){ long dst=prev_+(long)vget(&p_); long gs=(long)vget(&p_),ps=0,gg; \
+            for(gg=0;gg<gs;gg++){ long src=ps+(long)vget(&p_); ps=src; Wd_[nw_]=dst; Ws_[nw_]=src; Wc_[nw_]=(u32)vget(&p_); nw_++; } prev_=dst; } \
+          for(w_=0;w_<nw_;w_++) __builtin_prefetch(&v[(size_t)Ws_[w_]*B],0,1); \
+          for(w_=0;w_<nw_;w_++){ if(Wd_[w_]!=cur_){ if(cur_>=0) for(bb_=0;bb_<B;bb_++) vn_[(size_t)cur_*B+bb_]=barr(acc_[bb_],pr[bb_],mu[bb_]); cur_=Wd_[w_]; for(bb_=0;bb_<B;bb_++) acc_[bb_]=0; } \
+            for(bb_=0;bb_<B;bb_++) acc_[bb_]+=(u64)v[(size_t)Ws_[w_]*B+bb_]*Wc_[w_]; } } \
+        if(cur_>=0) for(bb_=0;bb_<B;bb_++) vn_[(size_t)cur_*B+bb_]=(u32)(acc_[bb_]%pr[bb_]); } } \
     free(v); v=vn_; }while(0)
   int L, X, ss, pfx=(aggr_R>=0)?junc_P0:Ltot_g, perbase=(aggr_R>=0)?junc_P0:(Ltot_g-Plevs), pref=c0_g+1;
   for(L=0;L<pfx;L++) APPLYB(L,L/m,L%m);
@@ -1065,23 +1085,15 @@ void exact_mode(int mm,int N){
   static u32* resid=0; resid=xrealloc(resid,(size_t)nP*(N+1)*sizeof(u32));
   long maxns=1; { int L; for(L=0;L<=Ltot_g;L++) if(nstate[L]>maxns) maxns=nstate[L]; }
   size_t vcols=(size_t)((N+3)*m+8);
-  int Bp=8;   /* Bp primes per edge-decode pass; batches run in parallel */
-  /* the compressed edge tables are already resident, so budget the replay vectors
-     (2 x maxns x Bp x 4B per concurrent batch) against what's LEFT under the cap. */
+  /* The per-level decode is now PARALLEL (split points), so each batch already uses
+     all cores. Make Bp as LARGE as memory allows (max decode amortisation) and run
+     the few batches SERIALLY -- the decode fills the cores within each batch. */
   long cap = mem_cap_bytes>0? mem_cap_bytes : (100L<<30);
   long budget = cap - rss_bytes() - (8L<<30);   /* leave 8GB headroom */
-  int ompmax=omp_get_max_threads();
-  /* Choose Bp so #batches ~= the cores memory allows: this fills the cores while
-     keeping Bp as LARGE as possible (each edge decode is amortised over Bp primes).
-     The decode is the cost, so fewer, fatter batches beat many single-prime ones. */
-  int NTr1=(int)(budget/((long)maxns*8L+(1L<<20))); if(NTr1<1)NTr1=1; if(NTr1>ompmax)NTr1=ompmax;
-  Bp=(nP+NTr1-1)/NTr1; if(Bp<1)Bp=1;
-  long perbatch=(long)maxns*Bp*8L+(1L<<20);
-  while(Bp>1 && budget<perbatch){ Bp--; perbatch=(long)maxns*Bp*8L+(1L<<20); }   /* ensure one batch fits */
+  int Bp=(int)(budget/((long)maxns*8L+(1L<<20)));   /* v+vn interleaved: 2 x maxns x Bp x 4B */
+  if(Bp<1)Bp=1; if(Bp>nP)Bp=nP; if(Bp>64)Bp=64;   /* Barrett acc[64] limits B<=64 */
   int nbatch=(nP+Bp-1)/Bp, bi;
-  int NTr=(int)(budget/perbatch); if(NTr<1)NTr=1; if(NTr>ompmax)NTr=ompmax; if(NTr>nbatch)NTr=nbatch;
-  fprintf(stderr,"replay: %d primes, %d batches of %d, %d parallel (maxns=%ld, budget %.0fGB)\n",nP,nbatch,Bp,NTr,maxns,budget/1073741824.0);
-#pragma omp parallel for schedule(dynamic,1) num_threads(NTr)
+  fprintf(stderr,"replay: %d primes, %d batches of %d, parallel decode (maxns=%ld, budget %.0fGB)\n",nP,nbatch,Bp,maxns,budget/1073741824.0);
   for(bi=0;bi<nbatch;bi++){ int base=bi*Bp, bb=nP-base; if(bb>Bp)bb=Bp;
     u32* out=xcalloc(vcols*bb,sizeof(u32));
     wfree_replay_batch(N,pr+base,bb,out,vcols);
