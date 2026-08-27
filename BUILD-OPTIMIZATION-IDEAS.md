@@ -13,21 +13,27 @@ Status legend: ⬜ todo · 🔬 experimenting · ✅ done/adopted · ❌ tried, 
 
 ## A. Kill redundant re-expansion (algorithmic — biggest lever)
 
-- **A1. Memoization / closure BFS** ⬜
-  Expand each *distinct* state ONCE (cache its successor edges); later columns hit
-  the cache instead of re-running `add_derived`. The sweep currently re-expands the
-  accumulated set every column (~8× total, since Sₖ₋₁ ⊆ Sₖ).
-  - Payoff: expand ~8× → **build ~2–3×**. Cost: caches the edge table → **+memory**.
-  - Depends/pairs with: B1 (compress the cached state/edges).
+- **A1. Memoization / closure BFS** ⬜ ← **the chosen approach (subsumes A2)**
+  Build the transfer matrix by BFS from the seed: expand each *reachable* state ONCE,
+  store its successor edges in a growing edge table (hash state→id + edges), follow to
+  new states until closure. The sweep currently re-expands the accumulated set every
+  column (~5–8×, since Sₖ₋₁ ⊆ Sₖ). BFS expands each reachable state exactly once.
+  - Payoff: expand ~5–8× → **build ~2–3×**; also removes the sort/dedup (states are
+    discovered distinct). Cost: holds the edge table in RAM → **+memory** (pair with B1).
+  - The state graph is layered by substep mod m (periodic); BFS fills each (phase,state)
+    once. The edge table IS the saved transfer matrix — replay runs on it directly.
 
-- **A2. Direct enumeration of the state universe** ⬜
-  Frontier states = non-crossing partial matchings on 2m+1 positions (Catalan family).
-  Enumerate them combinatorially and compute each state's transfer edges directly —
-  **no growth sweep, no re-expansion, transfer matrix in one shot**. Reachability is
-  then left to the SpMV (zeros for unreachable).
-  - Payoff: eliminates the discovery sweep + all re-expansion. Bigger than A1.
-  - Risk: the "valid non-crossing" universe may be >> the reachable set (over-generation).
-  - **Cheap pre-experiment: measure |universe| / |reachable| before committing.**
+- **A2. Direct enumeration of the state universe** 💤 (calibrated; A1 is strictly better)
+  Idea was to enumerate the frontier-state universe and compute edges directly, no sweep.
+  - **Calibration (2026-08-27):** states are NOT non-crossing (knight paths cross in the
+    plane), so the universe = ALL partial matchings + bare/inner labels. Exact count
+    `U(q)=Σ_k C(q,2k)(2k−1)!!·2^{q−2k}`. Verified on m=5 (q=11): U=538,078, reachable=143,448,
+    **reachable ⊆ universe ✓**, ratio **U/R = 3.75** (only 26.7% of the universe reachable).
+    Ratio falls with m: 3.75(m5) → 2.6(m6) → 1.7(m7) → ~1.4(m8).
+  - **Verdict:** the universe is only O(1)× the reachable set (good), BUT A1's BFS expands
+    ONLY reachable states (1×) with no over-generation, and stores only the reachable edge
+    table — strictly better than enumerating+pruning the universe (1.7–3.75×). So do A1.
+    (A2 stays parked as the fallback if BFS turns out awkward.)
 
 ## B. Reduce the state count / its footprint
 
