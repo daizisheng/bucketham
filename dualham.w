@@ -478,6 +478,7 @@ int stop_after_record=0; int direct_cov_g=0;
 int stream_edges=0; FILE* rec_fp=0; char rec_path[4096]; long nstate_off=0;  /* out-of-core recording */
 int stream_spmv=0; FILE* tbl_fp=0; long lev_edge_off[MAXLEV];  /* out-of-core SpMV (edges streamed from disk) */
 static u64 colfp_g[4096]; const char* ckpt_path=0; int ckpt_every=4;   /* checkpoint every K columns */
+static unsigned char* ksbuf[3]; static long kscnt[3], kslen[3];   /* rolling exact boundary key sets (last 3 cols) for period detection */
 u128* seedv; long seedn;
 Comp* reccomp_buf; long reccomp_n, reccomp_cap;
 int ecmp(const void*A,const void*B){ const Edge*a=A,*b=B; if(a->dst!=b->dst) return a->dst-b->dst; return a->src-b->src; }
@@ -685,9 +686,10 @@ int run_periodic(int mm,int Wb,int Next){
     { int recq; if(aggr_R>=0) recq = recording && ( s < (aggr_R+1)*m || (c0>=0 && s>=(c0+1)*m && s<=recend) );
       else recq = recording && s>=recstart && s<=recend;
       run_step(s, recq); }
-    if(s%m==m-1){ c=s/m; u64 h=1469598103934665603ULL; long t;
-      for(t=0;t<ncur;t++){ unsigned char*kk=curkp+curoff[t]; int L=curkl[t],z; for(z=0;z<L;z++){ h^=kk[z]; h*=1099511628211ULL; } h^=0x9e; h*=1099511628211ULL; }
-      colfp_g[c]=h;
+    if(s%m==m-1){ c=s/m;
+      { int slot=c%3; long tot=0,i2; for(i2=0;i2<ncur;i2++) tot+=curkl[i2];   /* keep the exact boundary key set (sorted) for cheap count + exact period test */
+        ksbuf[slot]=xrealloc(ksbuf[slot],tot+1); long off=0; for(i2=0;i2<ncur;i2++){ memcpy(ksbuf[slot]+off,curkp+curoff[i2],curkl[i2]); off+=curkl[i2]; }
+        kscnt[slot]=ncur; kslen[slot]=tot; }
       @<Detect and confirm the periodic column@>@; }
     if(s%m==m-1 && getenv("DUMPCOLS")){ /* dump this column's sorted key set (subset study) */
       char pth[4200]; snprintf(pth,sizeof pth,"%s/col%d.bin",getenv("DUMPCOLS"),s/m);
@@ -705,34 +707,31 @@ int run_periodic(int mm,int Wb,int Next){
   return c0;
 }
 
-@ We commit to a period only once the boundary fingerprint has {\it repeated}: a
-lone match |colfp[c]==colfp[c-p]| can be a coincidence of the near\--boundary
-columns, so we hold it as a candidate and require it to persist one full period
-further before recording. That guarantees the recorded columns sit in the bulk,
-far enough from the strip's right edge that the transfer is stationary; a strip
-too narrow to contain a confirmed period never records, which the finalizer
-below turns into a clear diagnostic instead of a corrupt table.
+@ We confirm the period {\bf exactly}, not by a fingerprint. At each boundary we
+first compare the state {\it count\/} $|S_c|$ against $|S_{c-p}|$ (O(1)); only if
+they match do we do the full byte compare of the sorted key sets ($S_c=S_{c-p}$).
+An exact match is {\it definitive\/}: the transfer is deterministic, so identical
+sets repeat forever -- no coincidence is possible (unlike a hash), and no
+"persist one more period" wait is needed. We commit at the {\bf first} exact
+repeat, which drops the conservative confirmation columns the old fingerprint
+scheme swept. (The periodic block is still recorded ahead as cols $c_0+1\ldots
+c_0+p$; since $S_{c_0}=S_{c_0-p}$ that is byte-identical to the preceding $p$
+columns.)
 
 @<Detect and confirm the periodic column@>=
-if(c0<0){
-  if(cand_p==0){
-    if(c>=1 && colfp_g[c]==colfp_g[c-1]){ cand_p=1; cand_c=c; }
-    else if(c>=2 && colfp_g[c]==colfp_g[c-2]){ cand_p=2; cand_c=c; }
-  } else if(colfp_g[c]==colfp_g[c-cand_p]){
-    if(c-cand_c>=cand_p && c+cand_p+3<=n){ /* confirmed, with bulk room for recording+seam */
-      period=cand_p; c0=c; recend=(c0+1+period)*m-1;
+if(c0<0){ int p;
+  for(p=1;p<=2;p++){ if(c<p) continue; int cur=c%3, old=(c-p)%3;
+    if(kscnt[cur]==kscnt[old] && kslen[cur]==kslen[old]
+       && memcmp(ksbuf[cur],ksbuf[old],kslen[cur])==0 && c+p+3<=n){
+      period=p; c0=c; recend=(c0+1+period)*m-1;
       Plevs=period*m; period_g=period; c0_g=c0; recend_col_g=c0+period;
       if(wfree){ seam_break=recend;
         if(aggr_R>=0){ junc_P0=(aggr_R+1)*m; Ltot_g=junc_P0+Plevs; }  /* prefix cols 0..R, then the periodic block */
         else Ltot_g=recend+1; }  /* recorded cols 0..c0+period */
-      else { recstart=(c0+1)*m; recording=1; seam_break=recend+3*m; }  /* sweep a few extra columns (direct seam) */
-      fprintf(stderr,"stable col %d, period %d (confirmed)%s\n",c0,period,
+      else { recstart=(c0+1)*m; recording=1; seam_break=recend+3*m; }
+      fprintf(stderr,"stable col %d, period %d (exact match)%s\n",c0,period,
         wfree?(aggr_R>=0?" [wfree aggressive: col 0..R + periodic]":" [wfree: recorded from col 0]"):"");
-    }
-  } else { cand_p=0;                        /* candidate broke: restart search here */
-    if(c>=1 && colfp_g[c]==colfp_g[c-1]){ cand_p=1; cand_c=c; }
-    else if(c>=2 && colfp_g[c]==colfp_g[c-2]){ cand_p=2; cand_c=c; }
-  }
+      break; } }
 }
 
 @ The direct sweep counts every column it reaches, exact once that column's
