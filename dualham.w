@@ -48,7 +48,7 @@ typedef unsigned __int128 u128;   /* exact build weights (u64 seeds overflow at 
 typedef unsigned int u32;
 
 @ @d MAXF 512
-@d MAXLEV 40
+@d MAXLEV 400
 @<Globals@>=
 int m,n,V;
 int NB[64*64][8], ND[64*64];
@@ -351,6 +351,9 @@ typedef struct{ int src,delta; u64 mult; } Comp;
 Edge* edges[MAXLEV]; long nedge[MAXLEV];
 Comp* comps[MAXLEV]; long ncomp[MAXLEV];
 long nstate[MAXLEV+1]; int Plevs;
+int wfree, Ltot_g;   /* weight-free replay: record edge tables from col 0, iterate SpMV
+                        from the trivial start [1] (regenerates all weights) instead of
+                        capturing a seed at c0. Ltot_g = total recorded levels (cols 0..c0+period). */
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int direct_valid_col_g;             /* direct |cnt| is exact for columns $\le$ this */
 int stop_after_record=0; int direct_cov_g=0;
@@ -524,10 +527,12 @@ int run_periodic(int mm,int Wb,int Next){
   int i,s,c; m=mm; n=Wb; build_board(); memset(cnt2,0,sizeof(cnt2));
   sym_fold_on = getenv("SYMFOLD")?1:0;
   if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
+  wfree = getenv("WFREE")?1:0; Ltot_g=0;
   recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
   if(resume_from<=0){ memset(cnt,0,sizeof(cnt)); seed_bucket(); }  /* fresh; else state is loaded */
   int c0=-1,period=0,recstart=-1,recend=-1,seam_break=-1;
   int cand_p=0,cand_c=-1;   /* pending (unconfirmed) period candidate */
+  if(wfree){ recording=1; recstart=0; recend=V; }  /* record every level from col 0; recend widened until the period is confirmed */
   for(s=(resume_from>0?resume_from:0);s<V;s++){
     if(recording && s==recstart){ seedn=ncur; seedv=xmalloc(ncur*sizeof(u128)); for(i=0;i<ncur;i++) seedv[i]=curw[i]; nstate[0]=ncur; reclev=0;
       if(getenv("SYMDUMP")){  /* dump frontier layout + all state keys, for the reflection-symmetry study */
@@ -546,6 +551,11 @@ int run_periodic(int mm,int Wb,int Next){
       for(t=0;t<ncur;t++){ unsigned char*kk=curkp+curoff[t]; int L=curkl[t],z; for(z=0;z<L;z++){ h^=kk[z]; h*=1099511628211ULL; } h^=0x9e; h*=1099511628211ULL; }
       colfp_g[c]=h;
       @<Detect and confirm the periodic column@>@; }
+    if(s%m==m-1 && getenv("DUMPCOLS")){ /* dump this column's sorted key set (subset study) */
+      char pth[4200]; snprintf(pth,sizeof pth,"%s/col%d.bin",getenv("DUMPCOLS"),s/m);
+      FILE*dp=fopen(pth,"wb"); long t2; int ql=frontier_before(s+1);
+      fwrite(&ql,sizeof(int),1,dp); fwrite(&ncur,sizeof(long),1,dp);
+      for(t2=0;t2<ncur;t2++) fwrite(curkp+curoff[t2],1,curkl[t2],dp); fclose(dp); }
     if(s%m==m-1 && getenv("DBG")) fprintf(stderr,"  col %d ncur=%ld rec=%d\n",s/m,ncur,recording);
     if(!recording && s%m==m-1 && (s/m)%ckpt_every==0) save_ckpt(s+1);
     if(recording && s==seam_break && stop_after_record) break;
@@ -571,10 +581,11 @@ if(c0<0){
     else if(c>=2 && colfp_g[c]==colfp_g[c-2]){ cand_p=2; cand_c=c; }
   } else if(colfp_g[c]==colfp_g[c-cand_p]){
     if(c-cand_c>=cand_p && c+cand_p+3<=n){ /* confirmed, with bulk room for recording+seam */
-      period=cand_p; c0=c; recstart=(c0+1)*m; recend=(c0+1+period)*m-1;
-      Plevs=period*m; recording=1; period_g=period; c0_g=c0; recend_col_g=c0+period;
-      seam_break=recend+3*m;              /* sweep a few extra columns (direct seam) */
-      fprintf(stderr,"stable col %d, period %d (confirmed)\n",c0,period);
+      period=cand_p; c0=c; recend=(c0+1+period)*m-1;
+      Plevs=period*m; period_g=period; c0_g=c0; recend_col_g=c0+period;
+      if(wfree){ Ltot_g=recend+1; seam_break=recend; }  /* recorded cols 0..c0+period; stop after the periodic block */
+      else { recstart=(c0+1)*m; recording=1; seam_break=recend+3*m; }  /* sweep a few extra columns (direct seam) */
+      fprintf(stderr,"stable col %d, period %d (confirmed)%s\n",c0,period, wfree?" [wfree: recorded from col 0]":"");
     }
   } else { cand_p=0;                        /* candidate broke: restart search here */
     if(c>=1 && colfp_g[c]==colfp_g[c-1]){ cand_p=1; cand_c=c; }
@@ -598,11 +609,15 @@ was too narrow and the recording is boundary\--contaminated.
     fprintf(stderr,"no confirmed period within strip W_b=%d: direct counts only "
       "(increase W_b to record the periodic transfer)\n",n); }
   else { direct_valid_col_g = (swept>=recend_col_g+3)? recend_col_g+1 : recend_col_g;
-    if(nstate[0]!=nstate[Plevs]){
-      fprintf(stderr,"ERROR: recorded transfer not stationary (nstate[0]=%ld "
-        "nstate[Plevs]=%ld); strip W_b=%d too narrow -- recording columns are "
-        "boundary-contaminated. Rebuild with a larger W_b.\n",
-        nstate[0],nstate[Plevs],n); exit(4); } }
+    /* stationarity: the periodic block must map its state set to an identical one.
+       Non-wfree indexes the block at [0,Plevs]; wfree records from col 0, so its
+       periodic block is the LAST Plevs levels: [Ltot-Plevs, Ltot]. */
+    long sa = wfree? nstate[Ltot_g-Plevs] : nstate[0];
+    long sb = wfree? nstate[Ltot_g]       : nstate[Plevs];
+    if(sa!=sb){
+      fprintf(stderr,"ERROR: recorded transfer not stationary (%ld vs %ld); strip "
+        "W_b=%d too narrow -- recording columns are boundary-contaminated. "
+        "Rebuild with a larger W_b.\n", sa,sb,n); exit(4); } }
 }
 
 @ @<Subroutines@>=
@@ -612,6 +627,12 @@ int build_extract(int mm,int Wb){ return run_periodic(mm,Wb,Wb); }
 void spmv_run(int Nto,int crosscheck){
   int i; memset(cnt2,0,sizeof(cnt2));
   @<Iterate the SpMV out to column $N$@>;
+  if(wfree){  /* validation: the replay (cnt2, from col 0) must match the direct sweep (cnt) everywhere direct is exact */
+    int good=1,cc;
+    for(cc=1;cc<=Nto && cc<=direct_cov_g;cc++) if((u64)red(cnt[cc*m])!=cnt2[cc*m]){ good=0;
+      fprintf(stderr,"WFREE MISMATCH c=%d direct=%llu replay=%llu\n",cc,(unsigned long long)(u64)red(cnt[cc*m]),(unsigned long long)cnt2[cc*m]); }
+    for(cc=1;cc<=Nto;cc++){ u64 val=cnt2[cc*m]; if(val) printf("open %dx%d = %llu%s\n",m,cc,val, cc>direct_cov_g?"  (replay)":"  (replay=direct)"); }
+    fprintf(stderr,"%s\n", good?"WFREE replay matches direct":"WFREE replay MISMATCH"); return; }
   { int good=1,cc;
     if(crosscheck) for(cc=c0_g+3;cc<=Nto && cc<=direct_cov_g;cc++) if((u64)cnt[cc*m]!=cnt2[cc*m]){ good=0;
       fprintf(stderr,"MISMATCH c=%d direct=%llu spmv=%llu\n",cc,(unsigned long long)(u64)cnt[cc*m],(unsigned long long)cnt2[cc*m]); }
@@ -620,6 +641,22 @@ void spmv_run(int Nto,int crosscheck){
 }
 
 @ @<Iterate the SpMV out to column $N$@>=
+if(wfree && Ltot_g>0){
+  /* Weight-free replay: start from the trivial vector at col 0 (a single state,
+     weight 1), apply the recorded prefix (cols $0..c_0+p$), then repeat the
+     periodic block. Regenerates every weight and completion; no seed needed. */
+#define APPLY(LL,ACOL,SUB) do{ int L_=(LL),abscol_=(ACOL),substep_=(SUB); long e_; \
+    for(e_=0;e_<ncomp[L_];e_++){ int idx_=abscol_*m+substep_+1+comps[L_][e_].delta; cnt2[idx_]=red(cnt2[idx_]+(u128)v[comps[L_][e_].src]*comps[L_][e_].mult); } \
+    u64* vn_=xcalloc(nstate[L_+1],sizeof(u64)); long ne_=nedge[L_],e2_; \
+    for(e2_=0;e2_<ne_;e2_++){ int d_=edges[L_][e2_].dst; vn_[d_]=red(vn_[d_]+(u128)v[edges[L_][e2_].src]*edges[L_][e2_].c); } \
+    free(v); v=vn_; }while(0)
+  u64* v=xcalloc(nstate[0],sizeof(u64)); v[0]=1; int L;
+  for(L=0;L<Ltot_g;L++) APPLY(L, L/m, L%m);            /* prefix: cols 0..recend_col */
+  int basecol=recend_col_g+1;
+  while(basecol<=Nto){ int j; for(j=0;j<Plevs;j++) APPLY(Ltot_g-Plevs+j, basecol+j/m, j%m); basecol+=period_g; }
+  free(v);
+#undef APPLY
+} else
 if(c0_g>=0 && Plevs>0){ u64* v=xmalloc(nstate[0]*sizeof(u64)); { long i2; for(i2=0;i2<nstate[0];i2++) v[i2]=(u64)(MODP?seedv[i2]%MODP:seedv[i2]); }
   int basecol=c0_g+1;
   while(basecol<=Nto){ int L;
