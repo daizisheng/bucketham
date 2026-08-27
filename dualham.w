@@ -451,6 +451,15 @@ int wfree, Ltot_g;   /* weight-free replay: record edge tables from col 0, itera
                         capturing a seed at c0. Ltot_g = total recorded levels (cols 0..c0+period). */
 int no_replay;       /* build only (leave the edge tables in RAM; the caller replays) */
 int exact_capture;   /* the replay fills cnt2 but prints nothing (residues read by the exact CRT driver) */
+/* Aggressive recording: record only cols 0..aggr_R (the left-boundary transient)
+   plus the periodic block, SKIPPING the middle cols R+1..c0. Every column's state
+   set is a subset of the stable set (verified), and the transfer is bulk from a
+   couple columns in, so the periodic block reconstructs the middle columns. At the
+   junction we remap the col-R boundary vector into the stable set's canonical order
+   (|junc_remap[i]| = stable index of col-R state i, matched by key). -1 = off. */
+int aggr_R=-1, junc_P0;   /* junc_P0 = #prefix levels = (aggr_R+1)*m */
+unsigned char* junc_kr; long junc_nkr; int junc_klen;   /* col-R boundary keys */
+int* junc_remap; long junc_nstab;                       /* remap[i] -> stable index; #stable states */
 int period_g, c0_g, recend_col_g;   /* saved for dumping the extracted tables */
 int direct_valid_col_g;             /* direct |cnt| is exact for columns $\le$ this */
 int stop_after_record=0; int direct_cov_g=0;
@@ -625,6 +634,7 @@ int run_periodic(int mm,int Wb,int Next){
   if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
   wfree = 1; Ltot_g=0;   /* weight-free replay is the only build mode now */
   hashagg = getenv("HASHAGG")?1:0;
+  aggr_R = getenv("AGGR")? atoi(getenv("AGGR")) : -1;   /* aggressive: record only cols 0..AGGR + periodic block */
   if(hashagg && stream_edges){ fprintf(stderr,"HASHAGG is in-process only for now\n"); exit(4); }
   { int L; for(L=0;L<MAXLEV;L++){ if(cedge[L]){free(cedge[L]);cedge[L]=0;} edges[L]=0; ced_len[L]=0; nedge[L]=0; } }  /* fresh run: clear per-level edge stores */
   recording=0; reclev=0; c0_g=-1; recend_col_g=-1; direct_valid_col_g=-1; Plevs=0; seedn=0;
@@ -645,7 +655,22 @@ int run_periodic(int mm,int Wb,int Next){
         fwrite(hdr,sizeof(int),6,rec_fp); fwrite(&seedn,sizeof(long),1,rec_fp); fwrite(seedv,sizeof(u128),seedn,rec_fp);
         nstate_off=ftell(rec_fp); { long z[MAXLEV+1]; int L; for(L=0;L<=Plevs;L++) z[L]=0; fwrite(z,sizeof(long),Plevs+1,rec_fp); }
         if(ferror(rec_fp)){ fprintf(stderr,"disk write error on %s (out of space?)\n",rec_path); exit(3); } } }
-    run_step(s, recording && s>=recstart && s<=recend);
+    if(aggr_R>=0 && s==(aggr_R+1)*m){  /* capture the col-R boundary keys (col-R canonical order) */
+      junc_nkr=ncur; junc_klen=curkl[0]; junc_kr=xrealloc(junc_kr,ncur*(long)junc_klen+1);
+      long i2; for(i2=0;i2<ncur;i2++) memcpy(junc_kr+i2*junc_klen, curkp+curoff[i2], junc_klen); }
+    if(aggr_R>=0 && c0>=0 && period>0){  /* stable set reached at the phase matching col-R: build remap col-R -> stable by key.
+        The replay applies the periodic block from col R+1, which starts at periodic column pi=(R-c0) mod period,
+        whose INPUT is the col-(c0+pi) boundary -- capture THAT phase so the phases line up. */
+      int pi=((aggr_R-c0)%period+period)%period;
+      if(s==(c0+pi+1)*m){
+        junc_nstab=ncur; junc_remap=xrealloc(junc_remap,(junc_nkr+1)*sizeof(int)); long i2;
+        for(i2=0;i2<junc_nkr;i2++){ long lo=0,hi=ncur; unsigned char*kk=junc_kr+i2*junc_klen;
+          while(lo<hi){ long mid=(lo+hi)/2; int d=memcmp(curkp+curoff[mid],kk,junc_klen); if(d<0)lo=mid+1; else hi=mid; }
+          junc_remap[i2]=(lo<ncur && memcmp(curkp+curoff[lo],kk,junc_klen)==0)? (int)lo : -1; }
+        fprintf(stderr,"aggr junction: col-%d states %ld -> stable(phase %d) %ld (remap built)\n",aggr_R,junc_nkr,pi,junc_nstab); } }
+    { int recq; if(aggr_R>=0) recq = recording && ( s < (aggr_R+1)*m || (c0>=0 && s>=(c0+1)*m && s<=recend) );
+      else recq = recording && s>=recstart && s<=recend;
+      run_step(s, recq); }
     if(s%m==m-1){ c=s/m; u64 h=1469598103934665603ULL; long t;
       for(t=0;t<ncur;t++){ unsigned char*kk=curkp+curoff[t]; int L=curkl[t],z; for(z=0;z<L;z++){ h^=kk[z]; h*=1099511628211ULL; } h^=0x9e; h*=1099511628211ULL; }
       colfp_g[c]=h;
@@ -683,9 +708,12 @@ if(c0<0){
     if(c-cand_c>=cand_p && c+cand_p+3<=n){ /* confirmed, with bulk room for recording+seam */
       period=cand_p; c0=c; recend=(c0+1+period)*m-1;
       Plevs=period*m; period_g=period; c0_g=c0; recend_col_g=c0+period;
-      if(wfree){ Ltot_g=recend+1; seam_break=recend; }  /* recorded cols 0..c0+period; stop after the periodic block */
+      if(wfree){ seam_break=recend;
+        if(aggr_R>=0){ junc_P0=(aggr_R+1)*m; Ltot_g=junc_P0+Plevs; }  /* prefix cols 0..R, then the periodic block */
+        else Ltot_g=recend+1; }  /* recorded cols 0..c0+period */
       else { recstart=(c0+1)*m; recording=1; seam_break=recend+3*m; }  /* sweep a few extra columns (direct seam) */
-      fprintf(stderr,"stable col %d, period %d (confirmed)%s\n",c0,period, wfree?" [wfree: recorded from col 0]":"");
+      fprintf(stderr,"stable col %d, period %d (confirmed)%s\n",c0,period,
+        wfree?(aggr_R>=0?" [wfree aggressive: col 0..R + periodic]":" [wfree: recorded from col 0]"):"");
     }
   } else { cand_p=0;                        /* candidate broke: restart search here */
     if(c>=1 && colfp_g[c]==colfp_g[c-1]){ cand_p=1; cand_c=c; }
@@ -750,10 +778,16 @@ if(wfree && Ltot_g>0){
         for(g_=0;g_<gs_;g_++){ src_+=(long)vget(&p_); u64 c_=vget(&p_); vn_[dst_]=red(vn_[dst_]+(u128)v[src_]*c_); } } } \
     else { long ne_=nedge[L_],e2_; for(e2_=0;e2_<ne_;e2_++){ int d_=edges[L_][e2_].dst; vn_[d_]=red(vn_[d_]+(u128)v[edges[L_][e2_].src]*edges[L_][e2_].c); } } \
     free(v); v=vn_; }while(0)
-  u64* v=xcalloc(nstate[0],sizeof(u64)); v[0]=1; int L;
-  for(L=0;L<Ltot_g;L++) APPLY(L, L/m, L%m);            /* prefix: cols 0..recend_col */
-  int basecol=recend_col_g+1;
-  while(basecol<=Nto){ int j; for(j=0;j<Plevs;j++) APPLY(Ltot_g-Plevs+j, basecol+j/m, j%m); basecol+=period_g; }
+  u64* v=xcalloc(nstate[0],sizeof(u64)); v[0]=1;
+  int L, X, ss, pfx=(aggr_R>=0)?junc_P0:Ltot_g, perbase=(aggr_R>=0)?junc_P0:(Ltot_g-Plevs), pref=c0_g+1;
+  for(L=0;L<pfx;L++) APPLY(L, L/m, L%m);              /* prefix: cols 0..R (or 0..recend_col) */
+  int basecol;
+  if(aggr_R>=0){ u64* vs=xcalloc(junc_nstab,sizeof(u64)); long i2;   /* remap col-R -> stable order */
+    for(i2=0;i2<junc_nkr;i2++){ int j=junc_remap[i2]; if(j>=0) vs[j]=v[i2]; }
+    free(v); v=vs; basecol=aggr_R+1; }
+  else basecol=recend_col_g+1;
+  for(X=basecol; X<=Nto; X++){ int pc=((X-pref)%period_g+period_g)%period_g;   /* phase-aware: col X uses periodic column pc */
+    for(ss=0;ss<m;ss++) APPLY(perbase+pc*m+ss, X, ss); }
   free(v);
 #undef APPLY
 } else
@@ -1004,9 +1038,16 @@ void wfree_replay_batch(int Nto,u64*pr,int B,u32*out,size_t vcols){
       for(g_=0;g_<gs_;g_++){ src_+=(long)vget(&p_); u64 c_=vget(&p_); size_t di=(size_t)dst_*B, si=(size_t)src_*B; \
         for(b=0;b<B;b++){ vn_[di+b]=barr((u64)vn_[di+b]+(u64)v[si+b]*c_,pr[b],mu[b]); } } } \
     free(v); v=vn_; }while(0)
-  int L; for(L=0;L<Ltot_g;L++) APPLYB(L,L/m,L%m);
-  int basecol=recend_col_g+1;
-  while(basecol<=Nto){ int j; for(j=0;j<Plevs;j++) APPLYB(Ltot_g-Plevs+j, basecol+j/m, j%m); basecol+=period_g; }
+  int L, X, ss, pfx=(aggr_R>=0)?junc_P0:Ltot_g, perbase=(aggr_R>=0)?junc_P0:(Ltot_g-Plevs), pref=c0_g+1;
+  for(L=0;L<pfx;L++) APPLYB(L,L/m,L%m);
+  int basecol;
+  if(aggr_R>=0){  /* remap the col-R boundary vector (col-R order) into the stable order, then run the periodic block from col R+1 */
+    u32* vs=xcalloc((size_t)junc_nstab*B,sizeof(u32)); long i2;
+    for(i2=0;i2<junc_nkr;i2++){ int j=junc_remap[i2]; if(j>=0){ int bb; for(bb=0;bb<B;bb++) vs[(size_t)j*B+bb]=v[(size_t)i2*B+bb]; } }
+    free(v); v=vs; basecol=aggr_R+1;
+  } else basecol=recend_col_g+1;
+  for(X=basecol; X<=Nto; X++){ int pc=((X-pref)%period_g+period_g)%period_g;
+    for(ss=0;ss<m;ss++) APPLYB(perbase+pc*m+ss, X, ss); }
   free(v);
 #undef APPLYB
 }
