@@ -463,6 +463,7 @@ int no_replay;       /* build only (leave the edge tables in RAM; the caller rep
 int exact_capture;   /* the replay fills cnt2 but prints nothing (residues read by the exact CRT driver) */
 static double nowsec(void);
 double t_expand, t_reduce, t_compress;   /* build-phase timers (seconds) */
+long del_total, del_total2;   /* DELCHECK: states that vanished vs same-phase prev col (period 1 / period 2) */
 /* Aggressive recording: record only cols 0..aggr_R (the left-boundary transient)
    plus the periodic block, SKIPPING the middle cols R+1..c0. Every column's state
    set is a subset of the stable set (verified), and the transfer is bulk from a
@@ -646,7 +647,7 @@ int run_periodic(int mm,int Wb,int Next){
   sym_fold_on = getenv("SYMFOLD")?1:0;
   if(sym_fold_on) fprintf(stderr,"reflection fold ON (rowat outside-in? %s)\n", getenv("OUTIN")?"yes":"no");
   wfree = 1; Ltot_g=0;   /* weight-free replay is the only build mode now */
-  t_expand=t_reduce=t_compress=0;
+  t_expand=t_reduce=t_compress=0; del_total=del_total2=0;
   hashagg = getenv("HASHAGG")?1:0;
   aggr_R = getenv("AGGR")? atoi(getenv("AGGR")) : -1;   /* aggressive: record only cols 0..AGGR + periodic block */
   if(hashagg && stream_edges){ fprintf(stderr,"HASHAGG is in-process only for now\n"); exit(4); }
@@ -699,9 +700,22 @@ int run_periodic(int mm,int Wb,int Next){
     if(s%m==m-1 && getenv("DBG")) fprintf(stderr,"  col %d ncur=%ld rec=%d\n",s/m,ncur,recording);
     if(!recording && s%m==m-1 && (s/m)%ckpt_every==0) save_ckpt(s+1);
     if(recording && s==seam_break && stop_after_record) break;
+    if(getenv("DELCHECK")){  /* deletions vs SAME-PHASE previous column: s-m (period 1) and s-2m (period 2) */
+      static unsigned char* cb[96]; static long cc[96]; static int ck[96]; int W=2*m+2, sl=s%W;
+      long tot=0,i2; for(i2=0;i2<ncur;i2++) tot+=curkl[i2];
+      int P; for(P=1;P<=2;P++){ int back=P*m; if(s<back) continue; int op=(s-back)%W; if(ck[op]!=curkl[0]) continue;
+        int kl=ck[op]; long a,b=0,del=0;
+        for(a=0;a<cc[op];a++){ unsigned char*pk=cb[op]+a*kl;
+          while(b<ncur && memcmp(curkp+curoff[b],pk,kl)<0) b++;
+          if(b<ncur && memcmp(curkp+curoff[b],pk,kl)==0) b++; else del++; }
+        if(P==1) del_total+=del; else del_total2+=del;
+        if(del && s%m==m-1) fprintf(stderr,"  col %d boundary: %ld states in col-%d(p=%d) not here\n",s/m,del,s/m-P,P); }
+      cb[sl]=xrealloc(cb[sl],tot+1); { long off=0; for(i2=0;i2<ncur;i2++){memcpy(cb[sl]+off,curkp+curoff[i2],curkl[i2]); off+=curkl[i2];} } cc[sl]=ncur; ck[sl]=curkl[0]; }
     if(wfree && recording && recend>=0 && s>=recend) break;  /* wfree: nothing to sweep past the recorded block */
   }
   @<Finalize direct coverage and verify periodicity@>@;
+  if(getenv("DELCHECK")) fprintf(stderr,"DELCHECK: deletions vs prev col -- period1 (s-m)=%ld, period2 (s-2m)=%ld => %s\n",
+    del_total, del_total2, (del_total==0||del_total2==0)?"MONOTONE at the true period (each state expandable once)":"deletions at both periods");
   direct_cov_g = stop_after_record ? direct_valid_col_g : n;
   if(!stream_edges && !no_replay) spmv_run(Next, 1);   /* streamed edges are freed; SpMV via a separate `run` */
   return c0;

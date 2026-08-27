@@ -13,7 +13,32 @@ Status legend: ⬜ todo · 🔬 experimenting · ✅ done/adopted · ❌ tried, 
 
 ## A. Kill redundant re-expansion (algorithmic — biggest lever)
 
-- **A1. Memoization / closure BFS** ⬜ ← **the chosen approach (subsumes A2)**
+- **A1. Memoization / closure BFS** 🔬 ← **chosen; committing to the PARALLEL version**
+
+  **Cost analysis (2026-08-27) — must be PARALLEL to win:** the current sweep is already
+  16-core parallel. Effective wall (in "stable-set×" state-expansion units):
+  - current parallel sweep: ~8× expansions / 16 cores ≈ **0.5×**
+  - serial BFS: ~1.1× / 1 core ≈ **1.1×** → *2× SLOWER than the sweep* (loses the 16×)
+  - parallel BFS: ~1.1× / 16 cores ≈ **0.07×** → ~8× faster (if the cache parallelizes)
+
+  So A1 needs a **thread-safe sharded cache** (same hard problem as the parallel hash-agg).
+  The 43% sort is NOT helped (successors still deduped). Boundary caveat: cols 0,1 have a
+  different (boundary) transfer, don't cache them.
+
+  **Design (sharded parallel BFS / closure):** partition the state space by hash(key)%P;
+  each shard owned by one thread with its own hash(key→id)+worklist. Pop→expand(add_derived)
+  →successors; same-shard insert+enqueue, cross-shard route via an outbox; exchange outboxes;
+  repeat to global closure. Each (substep,state) expanded ONCE; edges collected per shard.
+  BFS yields the bulk stable set + periodic block; the transient (cols 0..R) still uses the
+  short sweep, then junction+replay as now.
+
+  **Plan:** (1) serial BFS closure prototype → validate it reproduces the periodic block /
+  OEIS on m=5/6 (correctness of "each state once = correct transfer"); (2) shard it for
+  parallelism; (3) integrate with transient + junction.
+
+  Memoization cache ≈ the periodic block (already stored under aggressive) → not much extra
+  memory for m=7 (~fits 128GB); for m=8 the cache is ~the full transfer (big) — A1 mainly a
+  build-SPEED lever, less an m=8-memory one.
   Build the transfer matrix by BFS from the seed: expand each *reachable* state ONCE,
   store its successor edges in a growing edge table (hash state→id + edges), follow to
   new states until closure. The sweep currently re-expands the accumulated set every
