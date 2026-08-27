@@ -975,14 +975,13 @@ edge tables, with interleaved |u32| vectors |v[i*B+b]| and Barrett reduction --
 so the expensive edge decode is amortised across |B| residues (|K/B| passes for
 |K| primes instead of |K|). Fills |cnt2b_g| (residues, indexed |(col)*B+b|).
 
-@<Globals@>=
-u32* cnt2b_g;
-
 @ @<Subroutines@>=
-void wfree_replay_batch(int Nto,u64*pr,int B){
-  int b; static u64 mu[64]; for(b=0;b<B;b++) mu[b]=(u64)((((u128)1)<<64)/pr[b]);
-  size_t vcols=(size_t)((Nto+3)*m+8), cbsz=vcols*B;   /* the periodic repeat can touch col Nto+1 */
-  cnt2b_g=xrealloc(cnt2b_g,cbsz*sizeof(u32)); memset(cnt2b_g,0,cbsz*sizeof(u32));
+/* Fills |out| (caller-owned, size |vcols*B|) with residues indexed |col*B+b|;
+   uses no globals, so a batch of primes runs on its own thread. */
+void wfree_replay_batch(int Nto,u64*pr,int B,u32*out,size_t vcols){
+  int b; u64 mu[64]; for(b=0;b<B;b++) mu[b]=(u64)((((u128)1)<<64)/pr[b]);
+  memset(out,0,vcols*B*sizeof(u32));
+  u32* cnt2b_g=out;
   u32* v=xcalloc((size_t)nstate[0]*B,sizeof(u32)); for(b=0;b<B;b++) v[b]=1;
 #define APPLYB(LL,ACOL,SUB) do{ int L_=(LL),abscol_=(ACOL),substep_=(SUB); long e_; \
     for(e_=0;e_<ncomp[L_];e_++){ size_t idx_=(size_t)(abscol_*m+substep_+1+comps[L_][e_].delta)*B; long sc_=comps[L_][e_].src; u64 mult_=comps[L_][e_].mult; \
@@ -1008,10 +1007,18 @@ void exact_mode(int mm,int N){
   no_replay=1; MODP=0; run_periodic(mm,Wb,N);   /* build the edge tables in RAM, no replay */
   no_replay=0;
   static u32* resid=0; resid=xrealloc(resid,(size_t)nP*(N+1)*sizeof(u32));
-  int Bp=16, base;   /* apply Bp primes per edge-decode pass */
-  for(base=0;base<nP;base+=Bp){ int bb=nP-base; if(bb>Bp)bb=Bp;
-    wfree_replay_batch(N,pr+base,bb);
-    for(c=1;c<=N;c++) for(b=0;b<bb;b++) resid[(size_t)(base+b)*(N+1)+c]=cnt2b_g[(size_t)(c*m)*bb+b]; }
+  long maxns=1; { int L; for(L=0;L<=Ltot_g;L++) if(nstate[L]>maxns) maxns=nstate[L]; }
+  size_t vcols=(size_t)((N+3)*m+8);
+  int Bp=8, nbatch=(nP+Bp-1)/Bp, bi;   /* Bp primes per edge-decode pass; batches run in parallel */
+  /* cap concurrent batches so the interleaved vectors (2 x maxns x Bp x 4B each) stay within ~70GB */
+  long budget=70L<<30; int NTr=(int)(budget/((long)maxns*Bp*8L+1)); if(NTr<1)NTr=1; if(NTr>omp_get_max_threads())NTr=omp_get_max_threads();
+  fprintf(stderr,"replay: %d primes, %d batches of %d, %d parallel (maxns=%ld)\n",nP,nbatch,Bp,NTr,maxns);
+#pragma omp parallel for schedule(dynamic,1) num_threads(NTr)
+  for(bi=0;bi<nbatch;bi++){ int base=bi*Bp, bb=nP-base; if(bb>Bp)bb=Bp;
+    u32* out=xcalloc(vcols*bb,sizeof(u32));
+    wfree_replay_batch(N,pr+base,bb,out,vcols);
+    int cc,k; for(cc=1;cc<=N;cc++) for(k=0;k<bb;k++) resid[(size_t)(base+k)*(N+1)+cc]=out[(size_t)(cc*m)*bb+k];
+    free(out); }
   for(c=1;c<=N;c++){
     BN x,M; bn_setu64(&x,resid[c]); bn_setu64(&M,pr[0]);
     for(b=1;b<nP;b++){ u64 p=pr[b], xm=bn_mod(&x,p);
