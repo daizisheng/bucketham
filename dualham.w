@@ -223,7 +223,7 @@ static u64* ha_ea; static long ha_ea_n, ha_ea_cap;          /* edge accumulator:
 static unsigned char* ha_sb; static int ha_sl;              /* sort context for the id permutation */
 
 @ @<Subroutines@>=
-static int vput(unsigned char*p,u64 x); static u64 vget(unsigned char**pp);   /* LEB128 varints (defined with the compressed tables); used here to encode/decode edges */
+static int vput(unsigned char*p,u64 x); static u64 vget(unsigned char**pp); static int vlen(u64 x);   /* LEB128 varints (defined with the compressed tables); used here to encode/decode edges */
 static u64 ha_hash(unsigned char*k,int len){ u64 h=1469598103934665603ULL; int i; for(i=0;i<len;i++){ h^=k[i]; h*=1099511628211ULL; } return h; }
 static void ha_rehash(long ns){ ha_slot=xrealloc(ha_slot,ns*sizeof(long)); long i; for(i=0;i<ns;i++) ha_slot[i]=0; ha_nslot=ns;
   long mask=ns-1,id; for(id=0;id<ha_n;id++){ u64 h=ha_hash(ha_keys+id*(long)ha_sl,ha_sl); long p=h&mask; while(ha_slot[p]) p=(p+1)&mask; ha_slot[p]=id+1; } }
@@ -341,17 +341,28 @@ void sort_reduce(int s,int rec){
       edges[reclev]=0; comps[reclev]=0;
     } else {  /* in-process: compress the coalesced, dst-sorted edges (scheme-A varints)
                  straight into RAM -- ~4-6 B/edge instead of a raw 16 B Edge, so the
-                 from-col-0 edge tables fit in memory (e.g. m=7 in 128 GB). The ranges
-                 are disjoint dst-ordered blocks, so a single pass encodes them. */
-      long cap=o*8+4096; unsigned char* ob=xmalloc(cap); long olen=0, prev_dst=-1;
-      for(r2=0;r2<P;r2++){ long e2=0;
-        while(e2<rne2[r2]){ if(olen+64>cap){ cap=cap*2; ob=xrealloc(ob,cap); }
-          long dst=re[r2][e2].dst; olen+=vput(ob+olen,(u64)(dst-prev_dst));
+                 from-col-0 edge tables fit in memory. The ranges are disjoint
+                 dst-ordered blocks, so we compress them in PARALLEL: pass 1 measures
+                 each range's byte length (cross-range dst-delta included) to place it
+                 in the final buffer, pass 2 encodes into that slot -- no serial
+                 bottleneck and no memory spike. */
+      static long rpd[NRNG], rolen[NRNG], roff[NRNG];
+      for(r2=0;r2<P;r2++){ long pd=-1; int tt; for(tt=r2-1;tt>=0;tt--) if(rne2[tt]>0){ pd=re[tt][rne2[tt]-1].dst; break; } rpd[r2]=pd; }
+#pragma omp parallel for schedule(dynamic,1)
+      for(r2=0;r2<P;r2++){ long e2=0,len=0,prev_dst=rpd[r2];
+        while(e2<rne2[r2]){ long dst=re[r2][e2].dst; len+=vlen((u64)(dst-prev_dst));
+          long j=e2; while(j<rne2[r2] && re[r2][j].dst==dst) j++; len+=vlen((u64)(j-e2));
+          long prev_src=0,k; for(k=e2;k<j;k++){ len+=vlen((u64)(re[r2][k].src-prev_src)); prev_src=re[r2][k].src; len+=vlen(re[r2][k].c); }
+          prev_dst=dst; e2=j; } rolen[r2]=len; }
+      long tot=0; for(r2=0;r2<P;r2++){ roff[r2]=tot; tot+=rolen[r2]; }
+      unsigned char* ob=xmalloc(tot+16);
+#pragma omp parallel for schedule(dynamic,1)
+      for(r2=0;r2<P;r2++){ long e2=0,olen=roff[r2],prev_dst=rpd[r2];
+        while(e2<rne2[r2]){ long dst=re[r2][e2].dst; olen+=vput(ob+olen,(u64)(dst-prev_dst));
           long j=e2; while(j<rne2[r2] && re[r2][j].dst==dst) j++; olen+=vput(ob+olen,(u64)(j-e2));
-          long prev_src=0,k; for(k=e2;k<j;k++){ if(olen+32>cap){ cap=cap*2; ob=xrealloc(ob,cap); }
-            olen+=vput(ob+olen,(u64)(re[r2][k].src-prev_src)); prev_src=re[r2][k].src; olen+=vput(ob+olen,re[r2][k].c); }
+          long prev_src=0,k; for(k=e2;k<j;k++){ olen+=vput(ob+olen,(u64)(re[r2][k].src-prev_src)); prev_src=re[r2][k].src; olen+=vput(ob+olen,re[r2][k].c); }
           prev_dst=dst; e2=j; } }
-      cedge[reclev]=ob; ced_len[reclev]=olen; edges[reclev]=0;
+      cedge[reclev]=ob; ced_len[reclev]=tot; edges[reclev]=0;
       comps[reclev]=xmalloc((reccomp_n+1)*sizeof(Comp)); memcpy(comps[reclev],reccomp_buf,reccomp_n*sizeof(Comp));
     }
     reclev++; }
@@ -845,6 +856,7 @@ long* csoff[MAXLEV]; long* csdst[MAXLEV]; int csn[MAXLEV];
 
 @ @<Subroutines@>=
 static int vput(unsigned char*p,u64 x){ int n=0; while(x>=0x80){ p[n++]=(x&0x7f)|0x80; x>>=7; } p[n++]=(unsigned char)x; return n; }
+static int vlen(u64 x){ int n=1; while(x>=0x80){ x>>=7; n++; } return n; }   /* bytes vput would write */
 static u64 vget(unsigned char**pp){ unsigned char*p=*pp; u64 x=0; int sh=0; unsigned char b; do{ b=*p++; x|=(u64)(b&0x7f)<<sh; sh+=7; }while(b&0x80); *pp=p; return x; }
 static inline u32 barr(u64 x,u64 p,u64 mu){ u64 q=(u64)(((u128)x*mu)>>64); u64 r=x-q*p; if(r>=p)r-=p; if(r>=p)r-=p; return (u32)r; }
 void compress_table(const char*in,const char*out){
@@ -1000,25 +1012,38 @@ void wfree_replay_batch(int Nto,u64*pr,int B,u32*out,size_t vcols){
 }
 
 @ @<Subroutines@>=
+static double nowsec(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 void exact_mode(int mm,int N){
   int Wb=20, b, c; int K=(3*mm*N)/31 + 6;   /* rigorous bound + slack for the drop-a-prime check */
   static u64 pr[512]; if(K>500)K=500; int nP=gen_primes(pr,K);
   fprintf(stderr,"exact m=%d to n=%d : %d primes (product > 2^%d, bound < 2^%d)\n",mm,N,nP,31*nP,3*mm*N);
+  double t0=nowsec();
   no_replay=1; MODP=0; run_periodic(mm,Wb,N);   /* build the edge tables in RAM, no replay */
+  double tb=nowsec(); fprintf(stderr,"[time] build %.1fs\n",tb-t0);
   no_replay=0;
   static u32* resid=0; resid=xrealloc(resid,(size_t)nP*(N+1)*sizeof(u32));
   long maxns=1; { int L; for(L=0;L<=Ltot_g;L++) if(nstate[L]>maxns) maxns=nstate[L]; }
   size_t vcols=(size_t)((N+3)*m+8);
-  int Bp=8, nbatch=(nP+Bp-1)/Bp, bi;   /* Bp primes per edge-decode pass; batches run in parallel */
-  /* cap concurrent batches so the interleaved vectors (2 x maxns x Bp x 4B each) stay within ~70GB */
-  long budget=70L<<30; int NTr=(int)(budget/((long)maxns*Bp*8L+1)); if(NTr<1)NTr=1; if(NTr>omp_get_max_threads())NTr=omp_get_max_threads();
-  fprintf(stderr,"replay: %d primes, %d batches of %d, %d parallel (maxns=%ld)\n",nP,nbatch,Bp,NTr,maxns);
+  int Bp=8;   /* Bp primes per edge-decode pass; batches run in parallel */
+  /* the compressed edge tables are already resident, so budget the replay vectors
+     (2 x maxns x Bp x 4B per concurrent batch) against what's LEFT under the cap. */
+  long cap = mem_cap_bytes>0? mem_cap_bytes : (100L<<30);
+  long budget = cap - rss_bytes() - (8L<<30);   /* leave 8GB headroom */
+  long perbatch = (long)maxns*Bp*8L + (1L<<20);
+  while(Bp>1 && budget < perbatch){ Bp/=2; perbatch=(long)maxns*Bp*8L+(1L<<20); }   /* shrink the batch if even one won't fit */
+  int NTr=(int)(budget/perbatch); if(NTr<1)NTr=1; if(NTr>omp_get_max_threads())NTr=omp_get_max_threads();
+  /* if batches < threads, shrink Bp to fill the cores (each batch is smaller, so more also fit) */
+  if((nP+Bp-1)/Bp < NTr){ int Bn=(nP+NTr-1)/NTr; if(Bn<1)Bn=1; if(Bn<Bp) Bp=Bn;
+    perbatch=(long)maxns*Bp*8L+(1L<<20); NTr=(int)(budget/perbatch); if(NTr<1)NTr=1; if(NTr>omp_get_max_threads())NTr=omp_get_max_threads(); }
+  int nbatch=(nP+Bp-1)/Bp, bi;
+  fprintf(stderr,"replay: %d primes, %d batches of %d, %d parallel (maxns=%ld, budget %.0fGB)\n",nP,nbatch,Bp,NTr,maxns,budget/1073741824.0);
 #pragma omp parallel for schedule(dynamic,1) num_threads(NTr)
   for(bi=0;bi<nbatch;bi++){ int base=bi*Bp, bb=nP-base; if(bb>Bp)bb=Bp;
     u32* out=xcalloc(vcols*bb,sizeof(u32));
     wfree_replay_batch(N,pr+base,bb,out,vcols);
     int cc,k; for(cc=1;cc<=N;cc++) for(k=0;k<bb;k++) resid[(size_t)(base+k)*(N+1)+cc]=out[(size_t)(cc*m)*bb+k];
     free(out); }
+  { double tr=nowsec(); fprintf(stderr,"[time] replay %.1fs\n",tr-tb); tb=tr; }
   for(c=1;c<=N;c++){
     BN x,M; bn_setu64(&x,resid[c]); bn_setu64(&M,pr[0]);
     for(b=1;b<nP;b++){ u64 p=pr[b], xm=bn_mod(&x,p);
